@@ -6,6 +6,15 @@ const state = {
   serverPort: 3055, // Default port
 };
 
+// Pending uploads waiting for UI thread response
+const pendingUploads = new Map();
+
+function generateId() {
+  return (
+    Date.now().toString(36) + Math.random().toString(36).substr(2, 5)
+  );
+}
+
 
 // Helper function for progress updates
 async function sendProgressUpdate(
@@ -104,6 +113,22 @@ figma.ui.onmessage = async (msg) => {
         });
       }
       break;
+    case "upload-complete":
+      if (pendingUploads.has(msg.requestId)) {
+        const { resolve, timeout } = pendingUploads.get(msg.requestId);
+        clearTimeout(timeout);
+        pendingUploads.delete(msg.requestId);
+        resolve(msg.result);
+      }
+      break;
+    case "upload-error":
+      if (pendingUploads.has(msg.requestId)) {
+        const { reject, timeout } = pendingUploads.get(msg.requestId);
+        clearTimeout(timeout);
+        pendingUploads.delete(msg.requestId);
+        reject(new Error(msg.error || "Upload failed"));
+      }
+      break;
   }
 };
 
@@ -170,6 +195,8 @@ async function handleCommand(command, params) {
       return await createComponentInstance(params);
     case "export_node_as_image":
       return await exportNodeAsImage(params);
+    case "export_and_upload_image":
+      return await exportAndUploadImage(params);
     case "set_corner_radius":
       return await setCornerRadius(params);
     case "set_text_content":
@@ -1345,6 +1372,45 @@ async function exportNodeAsImage(params) {
     throw new Error(`Error exporting node as image: ${error.message}`);
   }
 }
+
+async function exportAndUploadImage(params) {
+  const { nodeId, uploadUrl, format = "PNG", scale = 1, filename } = params || {};
+
+  if (!nodeId) {
+    throw new Error("Missing nodeId parameter");
+  }
+  if (!uploadUrl) {
+    throw new Error("Missing uploadUrl parameter");
+  }
+
+  // Export the image first
+  const exportResult = await exportNodeAsImage({ nodeId, format, scale });
+
+  // Create a pending upload entry
+  const requestId = generateId();
+
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      if (pendingUploads.has(requestId)) {
+        pendingUploads.delete(requestId);
+        reject(new Error("Upload timeout after 60s"));
+      }
+    }, 60000);
+
+    pendingUploads.set(requestId, { resolve, reject, timeout });
+
+    // Send to UI thread for upload
+    figma.ui.postMessage({
+      type: "upload-image",
+      requestId,
+      uploadUrl,
+      imageData: exportResult.imageData,
+      mimeType: exportResult.mimeType,
+      filename: filename || `figma-export-${Date.now()}.png`,
+    });
+  });
+}
+
 function customBase64Encode(bytes) {
   const chars =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

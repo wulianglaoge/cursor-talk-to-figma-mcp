@@ -904,6 +904,39 @@
           case "analytics-client-id":
             analytics.setClientId(message.clientId);
             break;
+          case "upload-image":
+            (async () => {
+              try {
+                const result = await uploadImageToServer(
+                  message.uploadUrl,
+                  message.imageData,
+                  message.mimeType,
+                  message.filename
+                );
+                parent.postMessage(
+                  {
+                    pluginMessage: {
+                      type: "upload-complete",
+                      requestId: message.requestId,
+                      result,
+                    },
+                  },
+                  "*"
+                );
+              } catch (error) {
+                parent.postMessage(
+                  {
+                    pluginMessage: {
+                      type: "upload-error",
+                      requestId: message.requestId,
+                      error: error.message || "Upload failed",
+                    },
+                  },
+                  "*"
+                );
+              }
+            })();
+            break;
         }
       };
 
@@ -935,6 +968,34 @@
           null,
           2
         );
+      }
+
+      async function uploadImageToServer(uploadUrl, imageData, mimeType, filename) {
+        const dataUri = `data:${mimeType};base64,${imageData}`;
+        const response = await fetch(uploadUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ image: dataUri, filename }),
+        });
+
+        if (!response.ok) {
+          const text = await response.text();
+          throw new Error(`Upload failed: ${response.status} ${text}`);
+        }
+
+        const data = await response.json();
+        const url = data.caseResult?.url || data.file?.url;
+
+        if (!url) {
+          throw new Error("Upload response did not contain a URL");
+        }
+
+        return {
+          imageUrl: url,
+          mimeType,
+          filename: data.file?.originalname || filename,
+          size: data.file?.size,
+        };
       }
     </script>
   </body>

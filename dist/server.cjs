@@ -28,6 +28,8 @@ var import_stdio = require("@modelcontextprotocol/sdk/server/stdio.js");
 var import_zod = require("zod");
 var import_ws = __toESM(require("ws"), 1);
 var import_uuid = require("uuid");
+var import_https = __toESM(require("https"), 1);
+var import_http = __toESM(require("http"), 1);
 var logger = {
   info: (message) => process.stderr.write(`[INFO] ${message}
 `),
@@ -728,6 +730,90 @@ server.tool(
           {
             type: "text",
             text: `Error exporting node as image: ${error instanceof Error ? error.message : String(error)}`
+          }
+        ]
+      };
+    }
+  }
+);
+server.tool(
+  "export_and_upload_image",
+  "Export a node as an image from Figma and upload it to a remote server. The upload is performed by the MCP server (Node.js) so it can bypass browser certificate restrictions.",
+  {
+    nodeId: import_zod.z.string().describe("The ID of the node to export"),
+    uploadUrl: import_zod.z.string().describe("The URL to upload the image to (e.g. https://192.168.3.11:3000/api/upload-base64)"),
+    format: import_zod.z.enum(["PNG", "JPG", "SVG", "PDF"]).optional().describe("Export format"),
+    scale: import_zod.z.number().positive().optional().describe("Export scale"),
+    filename: import_zod.z.string().optional().describe("Optional filename for the uploaded image")
+  },
+  async ({ nodeId, uploadUrl, format, scale, filename }) => {
+    try {
+      const exportResult = await sendCommandToFigma("export_node_as_image", {
+        nodeId,
+        format: format || "PNG",
+        scale: scale || 1
+      });
+      const { imageData, mimeType } = exportResult;
+      const dataUri = `data:${mimeType || "image/png"};base64,${imageData}`;
+      const postData = JSON.stringify({
+        image: dataUri,
+        filename: filename || `figma-export-${Date.now()}.png`
+      });
+      const parsedUrl = new URL(uploadUrl);
+      const isHttps = parsedUrl.protocol === "https:";
+      const client = isHttps ? import_https.default : import_http.default;
+      const options = {
+        hostname: parsedUrl.hostname,
+        port: parsedUrl.port || (isHttps ? 443 : 80),
+        path: parsedUrl.pathname + parsedUrl.search,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(postData)
+        }
+      };
+      if (isHttps) {
+        options.rejectUnauthorized = false;
+      }
+      const uploadResponse = await new Promise((resolve, reject) => {
+        const req = client.request(options, (res) => {
+          let data = "";
+          res.on("data", (chunk) => {
+            data += chunk;
+          });
+          res.on("end", () => {
+            try {
+              resolve(JSON.parse(data));
+            } catch {
+              resolve({ raw: data });
+            }
+          });
+        });
+        req.on("error", (err) => reject(err));
+        req.write(postData);
+        req.end();
+      });
+      const imageUrl = uploadResponse.caseResult?.url || uploadResponse.file?.url;
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              imageUrl,
+              mimeType: mimeType || "image/png",
+              format: format || "PNG",
+              scale: scale || 1,
+              uploadResponse
+            })
+          }
+        ]
+      };
+    } catch (error) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Error exporting and uploading image: ${error instanceof Error ? error.message : String(error)}`
           }
         ]
       };
