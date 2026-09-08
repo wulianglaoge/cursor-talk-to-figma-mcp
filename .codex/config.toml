@@ -1,0 +1,3 @@
+[mcp_servers.TalkToFigma]
+args = ["cursor-talk-to-figma-mcp@latest"]
+command = "bunx"
