@@ -159,14 +159,14 @@ async function handleCommand(command, params) {
       if (!params || !params.nodeId) {
         throw new Error("Missing nodeId parameter");
       }
-      return await getNodeInfo(params.nodeId);
+      return await getNodeInfo(params.nodeId, params);
     case "get_nodes_info":
       if (!params || !params.nodeIds || !Array.isArray(params.nodeIds)) {
         throw new Error("Missing or invalid nodeIds parameter");
       }
-      return await getNodesInfo(params.nodeIds);
+      return await getNodesInfo(params.nodeIds, params);
     case "read_my_design":
-      return await readMyDesign();
+      return await readMyDesign(params);
     case "create_rectangle":
       return await createRectangle(params);
     case "create_frame":
@@ -354,16 +354,109 @@ function rgbaToHex(color) {
   );
 }
 
-function filterFigmaNode(node) {
-  if (node.type === "VECTOR") {
-    return null;
-  }
+const NODE_DATA_FIELDS = [
+  "visible",
+  "opacity",
+  "blendMode",
+  "clipsContent",
+  "isMask",
+  "maskType",
+  "absoluteBoundingBox",
+  "absoluteRenderBounds",
+  "relativeTransform",
+  "x",
+  "y",
+  "width",
+  "height",
+  "rotation",
+  "constraints",
+  "layoutMode",
+  "primaryAxisAlignItems",
+  "counterAxisAlignItems",
+  "paddingLeft",
+  "paddingRight",
+  "paddingTop",
+  "paddingBottom",
+  "itemSpacing",
+  "counterAxisSpacing",
+  "layoutWrap",
+  "layoutSizingHorizontal",
+  "layoutSizingVertical",
+  "layoutPositioning",
+  "layoutAlign",
+  "layoutGrow",
+  "minWidth",
+  "maxWidth",
+  "minHeight",
+  "maxHeight",
+  "cornerRadius",
+  "rectangleCornerRadii",
+  "topLeftRadius",
+  "topRightRadius",
+  "bottomRightRadius",
+  "bottomLeftRadius",
+  "cornerSmoothing",
+  "strokeWeight",
+  "individualStrokeWeights",
+  "strokeAlign",
+  "dashPattern",
+  "strokeCap",
+  "strokeJoin",
+  "strokeMiterAngle",
+  "effects",
+  "textAutoResize",
+  "characterStyleOverrides",
+  "styleOverrideTable",
+  "componentId",
+  "componentProperties",
+  "componentPropertyReferences",
+];
 
+const GEOMETRY_FIELDS = [
+  "vectorPaths",
+  "vectorNetwork",
+  "fillGeometry",
+  "strokeGeometry",
+];
+
+function indexSceneNodes(node, index = new Map()) {
+  index.set(node.id, node);
+  if ("children" in node) {
+    for (const child of node.children) {
+      indexSceneNodes(child, index);
+    }
+  }
+  return index;
+}
+
+function filterFigmaNode(node, options = {}, parentId, sceneNodes = new Map()) {
   var filtered = {
     id: node.id,
     name: node.name,
     type: node.type,
   };
+
+  if (parentId !== undefined) {
+    filtered.parentId = parentId;
+  }
+
+  const sourceNode = sceneNodes.get(node.id);
+
+  for (const field of NODE_DATA_FIELDS) {
+    const value = node[field] !== undefined ? node[field] : sourceNode?.[field];
+    if (value !== undefined) {
+      filtered[field] = typeof value === "symbol" ? "MIXED" : value;
+    }
+  }
+
+  if (options.includeGeometry) {
+    for (const field of GEOMETRY_FIELDS) {
+      const value = sourceNode?.[field] !== undefined ? sourceNode[field] : node[field];
+      if (value !== undefined) {
+        filtered[field] = value;
+      }
+    }
+  }
 
   if (node.fills && node.fills.length > 0) {
     filtered.fills = node.fills.map((fill) => {
@@ -403,44 +496,25 @@ function filterFigmaNode(node) {
     });
   }
 
-  if (node.cornerRadius !== undefined) {
-    filtered.cornerRadius = node.cornerRadius;
-  }
-
-  if (node.absoluteBoundingBox) {
-    filtered.absoluteBoundingBox = node.absoluteBoundingBox;
-  }
-
-  if (node.characters) {
+  if (node.characters !== undefined) {
     filtered.characters = node.characters;
   }
 
   if (node.style) {
-    filtered.style = {
-      fontFamily: node.style.fontFamily,
-      fontStyle: node.style.fontStyle,
-      fontWeight: node.style.fontWeight,
-      fontSize: node.style.fontSize,
-      textAlignHorizontal: node.style.textAlignHorizontal,
-      letterSpacing: node.style.letterSpacing,
-      lineHeightPx: node.style.lineHeightPx,
-    };
+    filtered.style = Object.assign({}, node.style);
+    delete filtered.style.boundVariables;
   }
 
   if (node.children) {
-    filtered.children = node.children
-      .map((child) => {
-        return filterFigmaNode(child);
-      })
-      .filter((child) => {
-        return child !== null;
-      });
+    filtered.children = node.children.map((child) => {
+      return filterFigmaNode(child, options, node.id, sceneNodes);
+    });
   }
 
   return filtered;
 }
 
-async function getNodeInfo(nodeId) {
+async function getNodeInfo(nodeId, options = {}) {
   const node = await figma.getNodeByIdAsync(nodeId);
 
   if (!node) {
@@ -451,10 +525,10 @@ async function getNodeInfo(nodeId) {
     format: "JSON_REST_V1",
   });
 
-  return filterFigmaNode(response.document);
+  return filterFigmaNode(response.document, options, node.parent?.id, indexSceneNodes(node));
 }
 
-async function getNodesInfo(nodeIds) {
+async function getNodesInfo(nodeIds, options = {}) {
   try {
     // Load all nodes in parallel
     const nodes = await Promise.all(
@@ -472,7 +546,7 @@ async function getNodesInfo(nodeIds) {
         });
         return {
           nodeId: node.id,
-          document: filterFigmaNode(response.document),
+          document: filterFigmaNode(response.document, options, node.parent?.id, indexSceneNodes(node)),
         };
       })
     );
@@ -668,7 +742,7 @@ async function getReactions(nodeIds) {
   }
 }
 
-async function readMyDesign() {
+async function readMyDesign(options = {}) {
   try {
     // Load all selected nodes in parallel
     const nodes = await Promise.all(
@@ -686,7 +760,7 @@ async function readMyDesign() {
         });
         return {
           nodeId: node.id,
-          document: filterFigmaNode(response.document),
+          document: filterFigmaNode(response.document, options, node.parent?.id, indexSceneNodes(node)),
         };
       })
     );
@@ -1314,9 +1388,7 @@ async function createComponentInstance(params) {
 }
 
 async function exportNodeAsImage(params) {
-  const { nodeId, scale = 1 } = params || {};
-
-  const format = "PNG";
+  const { nodeId, format = "PNG", scale = 1 } = params || {};
 
   if (!nodeId) {
     throw new Error("Missing nodeId parameter");

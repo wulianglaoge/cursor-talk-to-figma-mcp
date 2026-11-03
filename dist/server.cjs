@@ -42,6 +42,20 @@ var logger = {
   log: (message) => process.stderr.write(`[LOG] ${message}
 `)
 };
+function redactImageDataForLog(value) {
+  if (Array.isArray(value)) {
+    return value.map(redactImageDataForLog);
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, nestedValue]) => [
+        key,
+        key === "imageData" && typeof nestedValue === "string" ? `[base64 ${nestedValue.length} chars]` : redactImageDataForLog(nestedValue)
+      ])
+    );
+  }
+  return value;
+}
 var ws = null;
 var pendingRequests = /* @__PURE__ */ new Map();
 var currentChannel = null;
@@ -110,10 +124,12 @@ server.tool(
 server.tool(
   "read_my_design",
   "Get detailed information about the current selection in Figma, including all node details",
-  {},
-  async () => {
+  {
+    includeGeometry: import_zod.z.boolean().optional().describe("Include vector paths and geometry data when present")
+  },
+  async ({ includeGeometry }) => {
     try {
-      const result = await sendCommandToFigma("read_my_design", {});
+      const result = await sendCommandToFigma("read_my_design", { includeGeometry });
       return {
         content: [
           {
@@ -138,16 +154,17 @@ server.tool(
   "get_node_info",
   "Get detailed information about a specific node in Figma",
   {
-    nodeId: import_zod.z.string().describe("The ID of the node to get information about")
+    nodeId: import_zod.z.string().describe("The ID of the node to get information about"),
+    includeGeometry: import_zod.z.boolean().optional().describe("Include vector paths and geometry data when present")
   },
-  async ({ nodeId }) => {
+  async ({ nodeId, includeGeometry }) => {
     try {
-      const result = await sendCommandToFigma("get_node_info", { nodeId });
+      const result = await sendCommandToFigma("get_node_info", { nodeId, includeGeometry });
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(filterFigmaNode(result))
+            text: JSON.stringify(result)
           }
         ]
       };
@@ -163,92 +180,18 @@ server.tool(
     }
   }
 );
-function rgbaToHex(color) {
-  if (color.startsWith("#")) {
-    return color;
-  }
-  const r = Math.round(color.r * 255);
-  const g = Math.round(color.g * 255);
-  const b = Math.round(color.b * 255);
-  const a = Math.round(color.a * 255);
-  return `#${r.toString(16).padStart(2, "0")}${g.toString(16).padStart(2, "0")}${b.toString(16).padStart(2, "0")}${a === 255 ? "" : a.toString(16).padStart(2, "0")}`;
-}
-function filterFigmaNode(node) {
-  if (node.type === "VECTOR") {
-    return null;
-  }
-  const filtered = {
-    id: node.id,
-    name: node.name,
-    type: node.type
-  };
-  if (node.fills && node.fills.length > 0) {
-    filtered.fills = node.fills.map((fill) => {
-      const processedFill = { ...fill };
-      delete processedFill.boundVariables;
-      delete processedFill.imageRef;
-      if (processedFill.gradientStops) {
-        processedFill.gradientStops = processedFill.gradientStops.map((stop) => {
-          const processedStop = { ...stop };
-          if (processedStop.color) {
-            processedStop.color = rgbaToHex(processedStop.color);
-          }
-          delete processedStop.boundVariables;
-          return processedStop;
-        });
-      }
-      if (processedFill.color) {
-        processedFill.color = rgbaToHex(processedFill.color);
-      }
-      return processedFill;
-    });
-  }
-  if (node.strokes && node.strokes.length > 0) {
-    filtered.strokes = node.strokes.map((stroke) => {
-      const processedStroke = { ...stroke };
-      delete processedStroke.boundVariables;
-      if (processedStroke.color) {
-        processedStroke.color = rgbaToHex(processedStroke.color);
-      }
-      return processedStroke;
-    });
-  }
-  if (node.cornerRadius !== void 0) {
-    filtered.cornerRadius = node.cornerRadius;
-  }
-  if (node.absoluteBoundingBox) {
-    filtered.absoluteBoundingBox = node.absoluteBoundingBox;
-  }
-  if (node.characters) {
-    filtered.characters = node.characters;
-  }
-  if (node.style) {
-    filtered.style = {
-      fontFamily: node.style.fontFamily,
-      fontStyle: node.style.fontStyle,
-      fontWeight: node.style.fontWeight,
-      fontSize: node.style.fontSize,
-      textAlignHorizontal: node.style.textAlignHorizontal,
-      letterSpacing: node.style.letterSpacing,
-      lineHeightPx: node.style.lineHeightPx
-    };
-  }
-  if (node.children) {
-    filtered.children = node.children.map((child) => filterFigmaNode(child)).filter((child) => child !== null);
-  }
-  return filtered;
-}
 server.tool(
   "get_nodes_info",
   "Get detailed information about multiple nodes in Figma",
   {
-    nodeIds: import_zod.z.array(import_zod.z.string()).describe("Array of node IDs to get information about")
+    nodeIds: import_zod.z.array(import_zod.z.string()).describe("Array of node IDs to get information about"),
+    includeGeometry: import_zod.z.boolean().optional().describe("Include vector paths and geometry data when present")
   },
-  async ({ nodeIds }) => {
+  async ({ nodeIds, includeGeometry }) => {
     try {
       const results = await Promise.all(
         nodeIds.map(async (nodeId) => {
-          const result = await sendCommandToFigma("get_node_info", { nodeId });
+          const result = await sendCommandToFigma("get_node_info", { nodeId, includeGeometry });
           return { nodeId, info: result };
         })
       );
@@ -256,7 +199,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: JSON.stringify(results.map((result) => filterFigmaNode(result.info)))
+            text: JSON.stringify(results)
           }
         ]
       };
@@ -753,11 +696,11 @@ server.tool(
         format: format || "PNG",
         scale: scale || 1
       });
-      const { imageData, mimeType } = exportResult;
+      const { imageData, mimeType, format: exportedFormat = "PNG" } = exportResult;
       const dataUri = `data:${mimeType || "image/png"};base64,${imageData}`;
       const postData = JSON.stringify({
         image: dataUri,
-        filename: filename || `figma-export-${Date.now()}.png`
+        filename: filename || `figma-export-${Date.now()}.${exportedFormat.toLowerCase()}`
       });
       const parsedUrl = new URL(uploadUrl);
       const isHttps = parsedUrl.protocol === "https:";
@@ -781,7 +724,17 @@ server.tool(
           res.on("data", (chunk) => {
             data += chunk;
           });
+          res.on("error", (err) => {
+            clearTimeout(uploadTimeout);
+            reject(err);
+          });
           res.on("end", () => {
+            clearTimeout(uploadTimeout);
+            const statusCode = res.statusCode ?? 0;
+            if (statusCode < 200 || statusCode >= 300) {
+              reject(new Error(`Upload failed with HTTP ${statusCode}: ${data.slice(0, 500)}`));
+              return;
+            }
             try {
               resolve(JSON.parse(data));
             } catch {
@@ -789,11 +742,24 @@ server.tool(
             }
           });
         });
-        req.on("error", (err) => reject(err));
+        const uploadTimeout = setTimeout(() => {
+          req.destroy();
+          reject(new Error("Upload timed out after 60s"));
+        }, 6e4);
+        req.on("error", (err) => {
+          clearTimeout(uploadTimeout);
+          reject(err);
+        });
         req.write(postData);
         req.end();
       });
+      if (uploadResponse.caseResult?.status === "error") {
+        throw new Error(`Upload case failed: ${uploadResponse.caseResult.message || "Unknown error"}`);
+      }
       const imageUrl = uploadResponse.caseResult?.url || uploadResponse.file?.url;
+      if (typeof imageUrl !== "string" || !imageUrl) {
+        throw new Error("Upload response did not contain an image URL");
+      }
       return {
         content: [
           {
@@ -801,7 +767,7 @@ server.tool(
             text: JSON.stringify({
               imageUrl,
               mimeType: mimeType || "image/png",
-              format: format || "PNG",
+              format: exportedFormat,
               scale: scale || 1,
               uploadResponse
             })
@@ -2349,8 +2315,9 @@ function connectToFigma(port = 3055) {
         return;
       }
       const myResponse = json.message;
-      logger.debug(`Received message: ${JSON.stringify(myResponse)}`);
-      logger.log("myResponse" + JSON.stringify(myResponse));
+      const logSafeResponse = redactImageDataForLog(myResponse);
+      logger.debug(`Received message: ${JSON.stringify(logSafeResponse)}`);
+      logger.log("myResponse" + JSON.stringify(logSafeResponse));
       if (myResponse.id && pendingRequests.has(myResponse.id) && myResponse.result) {
         const request = pendingRequests.get(myResponse.id);
         clearTimeout(request.timeout);
@@ -2398,7 +2365,18 @@ async function joinChannel(channelName) {
     throw error;
   }
 }
-function sendCommandToFigma(command, params = {}, timeoutMs = 3e4) {
+var DEFAULT_COMMAND_TIMEOUT_MS = 3e4;
+var COMMAND_TIMEOUT_MS = {
+  get_node_info: 6e4,
+  read_my_design: 6e4,
+  export_node_as_image: 12e4,
+  export_and_upload_image: 12e4,
+  scan_text_nodes: 12e4,
+  scan_nodes_by_types: 12e4,
+  set_multiple_annotations: 12e4
+};
+function sendCommandToFigma(command, params = {}, timeoutMs) {
+  const effectiveTimeoutMs = timeoutMs ?? COMMAND_TIMEOUT_MS[command] ?? DEFAULT_COMMAND_TIMEOUT_MS;
   return new Promise((resolve, reject) => {
     if (!ws || ws.readyState !== import_ws.default.OPEN) {
       connectToFigma();
@@ -2428,10 +2406,10 @@ function sendCommandToFigma(command, params = {}, timeoutMs = 3e4) {
     const timeout = setTimeout(() => {
       if (pendingRequests.has(id)) {
         pendingRequests.delete(id);
-        logger.error(`Request ${id} to Figma timed out after ${timeoutMs / 1e3} seconds`);
+        logger.error(`Request ${id} to Figma timed out after ${effectiveTimeoutMs / 1e3} seconds`);
         reject(new Error("Request to Figma timed out"));
       }
-    }, timeoutMs);
+    }, effectiveTimeoutMs);
     pendingRequests.set(id, {
       resolve,
       reject,

@@ -5,6 +5,23 @@ import { Server, ServerWebSocket } from "bun";
 // Store clients by channel
 const channels = new Map<string, Set<ServerWebSocket<any>>>();
 
+function redactImageDataForLog(value: any): any {
+  if (Array.isArray(value)) {
+    return value.map(redactImageDataForLog);
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, nestedValue]) => [
+        key,
+        key === "imageData" && typeof nestedValue === "string"
+          ? `[base64 ${nestedValue.length} chars]`
+          : redactImageDataForLog(nestedValue),
+      ])
+    );
+  }
+  return value;
+}
+
 function handleConnection(ws: ServerWebSocket<any>) {
   // Don't add to clients immediately - wait for channel join
   console.log("New client connected");
@@ -84,7 +101,7 @@ const server = Bun.serve({
         } else if (data.message?.result) {
           console.log(`Response: ID: ${data.id}, Has Result: ${!!data.message.result}`);
         }
-        console.log(`Full message:`, JSON.stringify(data, null, 2));
+        console.log(`Message:`, JSON.stringify(redactImageDataForLog(data), null, 2));
 
         if (data.type === "join") {
           const channelName = data.channel;
@@ -169,7 +186,7 @@ const server = Bun.serve({
                 channel: channelName
               };
               console.log(`\n=== Broadcasting to peer #${broadcastCount} ===`);
-              console.log(JSON.stringify(broadcastMessage, null, 2));
+              console.log(JSON.stringify(redactImageDataForLog(broadcastMessage), null, 2));
               client.send(JSON.stringify(broadcastMessage));
             }
           });

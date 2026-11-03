@@ -63,6 +63,23 @@ const logger = {
   log: (message: string) => process.stderr.write(`[LOG] ${message}\n`)
 };
 
+function redactImageDataForLog(value: any): any {
+  if (Array.isArray(value)) {
+    return value.map(redactImageDataForLog);
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, nestedValue]) => [
+        key,
+        key === "imageData" && typeof nestedValue === "string"
+          ? `[base64 ${nestedValue.length} chars]`
+          : redactImageDataForLog(nestedValue),
+      ])
+    );
+  }
+  return value;
+}
+
 // WebSocket connection and request tracking
 let ws: WebSocket | null = null;
 const pendingRequests = new Map<string, {
@@ -151,10 +168,12 @@ server.tool(
 server.tool(
   "read_my_design",
   "Get detailed information about the current selection in Figma, including all node details",
-  {},
-  async () => {
+  {
+    includeGeometry: z.boolean().optional().describe("Include vector paths and geometry data when present"),
+  },
+  async ({ includeGeometry }: any) => {
     try {
-      const result = await sendCommandToFigma("read_my_design", {});
+      const result = await sendCommandToFigma("read_my_design", { includeGeometry });
       return {
         content: [
           {
@@ -183,15 +202,16 @@ server.tool(
   "Get detailed information about a specific node in Figma",
   {
     nodeId: z.string().describe("The ID of the node to get information about"),
+    includeGeometry: z.boolean().optional().describe("Include vector paths and geometry data when present"),
   },
-  async ({ nodeId }: any) => {
+  async ({ nodeId, includeGeometry }: any) => {
     try {
-      const result = await sendCommandToFigma("get_node_info", { nodeId });
+      const result = await sendCommandToFigma("get_node_info", { nodeId, includeGeometry });
       return {
         content: [
           {
             type: "text",
-            text: JSON.stringify(filterFigmaNode(result))
+            text: JSON.stringify(result)
           }
         ]
       };
@@ -209,121 +229,19 @@ server.tool(
   }
 );
 
-function rgbaToHex(color: any): string {
-  // skip if color is already hex
-  if (color.startsWith('#')) {
-    return color;
-  }
-
-  const r = Math.round(color.r * 255);
-  const g = Math.round(color.g * 255);
-  const b = Math.round(color.b * 255);
-  const a = Math.round(color.a * 255);
-
-  return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}${a === 255 ? '' : a.toString(16).padStart(2, '0')}`;
-}
-
-function filterFigmaNode(node: any) {
-  // Skip VECTOR type nodes
-  if (node.type === "VECTOR") {
-    return null;
-  }
-
-  const filtered: any = {
-    id: node.id,
-    name: node.name,
-    type: node.type,
-  };
-
-  if (node.fills && node.fills.length > 0) {
-    filtered.fills = node.fills.map((fill: any) => {
-      const processedFill = { ...fill };
-
-      // Remove boundVariables and imageRef
-      delete processedFill.boundVariables;
-      delete processedFill.imageRef;
-
-      // Process gradientStops if present
-      if (processedFill.gradientStops) {
-        processedFill.gradientStops = processedFill.gradientStops.map((stop: any) => {
-          const processedStop = { ...stop };
-          // Convert color to hex if present
-          if (processedStop.color) {
-            processedStop.color = rgbaToHex(processedStop.color);
-          }
-          // Remove boundVariables
-          delete processedStop.boundVariables;
-          return processedStop;
-        });
-      }
-
-      // Convert solid fill colors to hex
-      if (processedFill.color) {
-        processedFill.color = rgbaToHex(processedFill.color);
-      }
-
-      return processedFill;
-    });
-  }
-
-  if (node.strokes && node.strokes.length > 0) {
-    filtered.strokes = node.strokes.map((stroke: any) => {
-      const processedStroke = { ...stroke };
-      // Remove boundVariables
-      delete processedStroke.boundVariables;
-      // Convert color to hex if present
-      if (processedStroke.color) {
-        processedStroke.color = rgbaToHex(processedStroke.color);
-      }
-      return processedStroke;
-    });
-  }
-
-  if (node.cornerRadius !== undefined) {
-    filtered.cornerRadius = node.cornerRadius;
-  }
-
-  if (node.absoluteBoundingBox) {
-    filtered.absoluteBoundingBox = node.absoluteBoundingBox;
-  }
-
-  if (node.characters) {
-    filtered.characters = node.characters;
-  }
-
-  if (node.style) {
-    filtered.style = {
-      fontFamily: node.style.fontFamily,
-      fontStyle: node.style.fontStyle,
-      fontWeight: node.style.fontWeight,
-      fontSize: node.style.fontSize,
-      textAlignHorizontal: node.style.textAlignHorizontal,
-      letterSpacing: node.style.letterSpacing,
-      lineHeightPx: node.style.lineHeightPx
-    };
-  }
-
-  if (node.children) {
-    filtered.children = node.children
-      .map((child: any) => filterFigmaNode(child))
-      .filter((child: any) => child !== null); // Remove null children (VECTOR nodes)
-  }
-
-  return filtered;
-}
-
 // Nodes Info Tool
 server.tool(
   "get_nodes_info",
   "Get detailed information about multiple nodes in Figma",
   {
-    nodeIds: z.array(z.string()).describe("Array of node IDs to get information about")
+    nodeIds: z.array(z.string()).describe("Array of node IDs to get information about"),
+    includeGeometry: z.boolean().optional().describe("Include vector paths and geometry data when present"),
   },
-  async ({ nodeIds }: any) => {
+  async ({ nodeIds, includeGeometry }: any) => {
     try {
       const results = await Promise.all(
         nodeIds.map(async (nodeId: any) => {
-          const result = await sendCommandToFigma('get_node_info', { nodeId });
+          const result = await sendCommandToFigma('get_node_info', { nodeId, includeGeometry });
           return { nodeId, info: result };
         })
       );
@@ -331,7 +249,7 @@ server.tool(
         content: [
           {
             type: "text",
-            text: JSON.stringify(results.map((result) => filterFigmaNode(result.info)))
+            text: JSON.stringify(results)
           }
         ]
       };
@@ -919,13 +837,17 @@ server.tool(
         format: format || "PNG",
         scale: scale || 1,
       });
-      const { imageData, mimeType } = exportResult as { imageData: string; mimeType: string };
+      const { imageData, mimeType, format: exportedFormat = "PNG" } = exportResult as {
+        imageData: string;
+        mimeType: string;
+        format?: string;
+      };
 
       // Step 2: Upload from Node.js side (bypasses browser certificate restrictions)
       const dataUri = `data:${mimeType || "image/png"};base64,${imageData}`;
       const postData = JSON.stringify({
         image: dataUri,
-        filename: filename || `figma-export-${Date.now()}.png`,
+        filename: filename || `figma-export-${Date.now()}.${exportedFormat.toLowerCase()}`,
       });
 
       const parsedUrl = new URL(uploadUrl);
@@ -952,7 +874,17 @@ server.tool(
         const req = client.request(options, (res) => {
           let data = "";
           res.on("data", (chunk) => { data += chunk; });
+          res.on("error", (err) => {
+            clearTimeout(uploadTimeout);
+            reject(err);
+          });
           res.on("end", () => {
+            clearTimeout(uploadTimeout);
+            const statusCode = res.statusCode ?? 0;
+            if (statusCode < 200 || statusCode >= 300) {
+              reject(new Error(`Upload failed with HTTP ${statusCode}: ${data.slice(0, 500)}`));
+              return;
+            }
             try {
               resolve(JSON.parse(data));
             } catch {
@@ -960,12 +892,26 @@ server.tool(
             }
           });
         });
-        req.on("error", (err) => reject(err));
+        const uploadTimeout = setTimeout(() => {
+          req.destroy();
+          reject(new Error("Upload timed out after 60s"));
+        }, 60000);
+        req.on("error", (err) => {
+          clearTimeout(uploadTimeout);
+          reject(err);
+        });
         req.write(postData);
         req.end();
       });
 
+      if (uploadResponse.caseResult?.status === "error") {
+        throw new Error(`Upload case failed: ${uploadResponse.caseResult.message || "Unknown error"}`);
+      }
+
       const imageUrl = uploadResponse.caseResult?.url || uploadResponse.file?.url;
+      if (typeof imageUrl !== "string" || !imageUrl) {
+        throw new Error("Upload response did not contain an image URL");
+      }
 
       return {
         content: [
@@ -974,7 +920,7 @@ server.tool(
             text: JSON.stringify({
               imageUrl,
               mimeType: mimeType || "image/png",
-              format: format || "PNG",
+              format: exportedFormat,
               scale: scale || 1,
               uploadResponse,
             }),
@@ -2757,8 +2703,9 @@ type FigmaCommand =
 type CommandParams = {
   get_document_info: Record<string, never>;
   get_selection: Record<string, never>;
-  get_node_info: { nodeId: string };
-  get_nodes_info: { nodeIds: string[] };
+  read_my_design: { includeGeometry?: boolean };
+  get_node_info: { nodeId: string; includeGeometry?: boolean };
+  get_nodes_info: { nodeIds: string[]; includeGeometry?: boolean };
   create_rectangle: {
     x: number;
     y: number;
@@ -3010,8 +2957,9 @@ function connectToFigma(port: number = 3055) {
 
       // Handle regular responses
       const myResponse = json.message;
-      logger.debug(`Received message: ${JSON.stringify(myResponse)}`);
-      logger.log('myResponse' + JSON.stringify(myResponse));
+      const logSafeResponse = redactImageDataForLog(myResponse);
+      logger.debug(`Received message: ${JSON.stringify(logSafeResponse)}`);
+      logger.log('myResponse' + JSON.stringify(logSafeResponse));
 
       // Handle response to a request
       if (
@@ -3078,12 +3026,25 @@ async function joinChannel(channelName: string): Promise<void> {
   }
 }
 
+const DEFAULT_COMMAND_TIMEOUT_MS = 30000;
+const COMMAND_TIMEOUT_MS: Partial<Record<FigmaCommand, number>> = {
+  get_node_info: 60000,
+  read_my_design: 60000,
+  export_node_as_image: 120000,
+  export_and_upload_image: 120000,
+  scan_text_nodes: 120000,
+  scan_nodes_by_types: 120000,
+  set_multiple_annotations: 120000,
+};
+
 // Function to send commands to Figma
 function sendCommandToFigma(
   command: FigmaCommand,
   params: unknown = {},
-  timeoutMs: number = 30000
+  timeoutMs?: number
 ): Promise<unknown> {
+  const effectiveTimeoutMs = timeoutMs ?? COMMAND_TIMEOUT_MS[command] ?? DEFAULT_COMMAND_TIMEOUT_MS;
+
   return new Promise((resolve, reject) => {
     // If not connected, try to connect first
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -3120,10 +3081,10 @@ function sendCommandToFigma(
     const timeout = setTimeout(() => {
       if (pendingRequests.has(id)) {
         pendingRequests.delete(id);
-        logger.error(`Request ${id} to Figma timed out after ${timeoutMs / 1000} seconds`);
+        logger.error(`Request ${id} to Figma timed out after ${effectiveTimeoutMs / 1000} seconds`);
         reject(new Error('Request to Figma timed out'));
       }
-    }, timeoutMs);
+    }, effectiveTimeoutMs);
 
     // Store the promise callbacks to resolve/reject later
     pendingRequests.set(id, {
