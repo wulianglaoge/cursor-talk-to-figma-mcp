@@ -29,6 +29,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.13.1",
+    "minio": "^8.0.7",
     "uuid": "latest",
     "ws": "latest",
     "zod": "3.22.4"

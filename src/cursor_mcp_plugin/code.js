@@ -99,7 +99,7 @@ figma.ui.onmessage = async (msg) => {
     case "execute-command":
       // Execute commands received from UI (which gets them from WebSocket)
       try {
-        const result = await handleCommand(msg.command, msg.params);
+        const result = await handleCommandWithHeartbeat(msg.command, msg.params);
         figma.ui.postMessage({
           type: "command-result",
           id: msg.id,
@@ -146,6 +146,30 @@ function updateSettings(settings) {
   figma.clientStorage.setAsync("settings", {
     serverPort: state.serverPort,
   });
+}
+
+async function handleCommandWithHeartbeat(command, params) {
+  const commandId = params?.commandId;
+  if (!commandId) return handleCommand(command, params);
+
+  const heartbeat = setInterval(() => {
+    sendProgressUpdate(
+      commandId,
+      command,
+      "in_progress",
+      0,
+      0,
+      0,
+      `${command} is still running`,
+      { heartbeat: true }
+    ).catch((error) => console.warn(`Heartbeat failed for ${command}: ${error.message}`));
+  }, 10000);
+
+  try {
+    return await handleCommand(command, params);
+  } finally {
+    clearInterval(heartbeat);
+  }
 }
 
 // Handle commands from UI
@@ -299,6 +323,9 @@ async function getDocumentInfo() {
       id: node.id,
       name: node.name,
       type: node.type,
+      visible: node.visible,
+      childCount: "children" in node ? node.children.length : 0,
+      absoluteBoundingBox: node.absoluteBoundingBox || null,
     })),
     currentPage: {
       id: page.id,
@@ -429,7 +456,29 @@ function indexSceneNodes(node, index = new Map()) {
   return index;
 }
 
-function filterFigmaNode(node, options = {}, parentId, sceneNodes = new Map()) {
+function countNodeTree(node) {
+  let count = 1;
+  if (node.children) {
+    for (const child of node.children) {
+      count += countNodeTree(child);
+    }
+  }
+  return count;
+}
+
+function filterFigmaNode(
+  node,
+  options = {},
+  parentId,
+  sceneNodes = new Map(),
+  depth = 0,
+  stats = { hiddenNodeCount: 0, depthLimitedNodeCount: 0 }
+) {
+  if (depth > 0 && !options.includeHidden && node.visible === false) {
+    stats.hiddenNodeCount += countNodeTree(node);
+    return null;
+  }
+
   var filtered = {
     id: node.id,
     name: node.name,
@@ -506,12 +555,102 @@ function filterFigmaNode(node, options = {}, parentId, sceneNodes = new Map()) {
   }
 
   if (node.children) {
-    filtered.children = node.children.map((child) => {
-      return filterFigmaNode(child, options, node.id, sceneNodes);
-    });
+    if (options.maxDepth !== undefined && depth >= options.maxDepth) {
+      for (const child of node.children) {
+        stats.depthLimitedNodeCount += countNodeTree(child);
+      }
+    } else {
+      const children = node.children
+        .map((child) => filterFigmaNode(child, options, node.id, sceneNodes, depth + 1, stats))
+        .filter((child) => child !== null);
+      if (children.length > 0) {
+        filtered.children = children;
+      }
+    }
   }
 
   return filtered;
+}
+
+function filterFigmaNodePage(root, options, parentId, sceneNodes) {
+  const maxNodes = options.maxNodes === undefined ? 300 : options.maxNodes;
+  if (!Number.isInteger(maxNodes) || maxNodes < 1) {
+    throw new Error("maxNodes must be a positive integer");
+  }
+  const cursor = options.cursor || "0";
+  if (!/^\d+$/.test(cursor)) {
+    throw new Error("cursor must be a nextCursor value returned by get_node_info");
+  }
+  const offset = Number(cursor);
+  const entries = [];
+  const parents = new Map();
+  let hiddenNodeCount = 0;
+  let depthLimitedNodeCount = 0;
+
+  function collect(node, depth) {
+    if (!node.children) return;
+    for (const child of node.children) {
+      if (!options.includeHidden && child.visible === false) {
+        hiddenNodeCount += countNodeTree(child);
+        continue;
+      }
+      if (options.maxDepth !== undefined && depth + 1 > options.maxDepth) {
+        depthLimitedNodeCount += countNodeTree(child);
+        continue;
+      }
+      entries.push(child);
+      parents.set(child.id, node.id);
+      collect(child, depth + 1);
+    }
+  }
+
+  collect(root, 0);
+  if (offset > entries.length) {
+    throw new Error(`Cursor ${cursor} is beyond the available node count ${entries.length}`);
+  }
+
+  const selected = entries.slice(offset, offset + maxNodes);
+  const included = new Set([root.id]);
+  for (const node of selected) {
+    included.add(node.id);
+    let ancestorId = parents.get(node.id);
+    while (ancestorId && ancestorId !== root.id) {
+      included.add(ancestorId);
+      ancestorId = parents.get(ancestorId);
+    }
+  }
+
+  function build(node, depth) {
+    const filtered = filterFigmaNode(
+      node,
+      { ...options, includeHidden: true, maxDepth: 0 },
+      depth === 0 ? parentId : parents.get(node.id),
+      sceneNodes
+    );
+    if (node.children) {
+      const children = node.children
+        .filter((child) => included.has(child.id))
+        .map((child) => build(child, depth + 1));
+      if (children.length > 0) {
+        filtered.children = children;
+      }
+    }
+    return filtered;
+  }
+
+  const result = build(root, 0);
+  const nextOffset = offset + selected.length;
+  result.page = {
+    cursor,
+    nextCursor: nextOffset < entries.length ? String(nextOffset) : null,
+    returnedNodes: selected.length,
+    includedNodes: included.size,
+    totalNodes: entries.length,
+    hiddenNodeCount,
+    depthLimitedNodeCount,
+    truncated: nextOffset < entries.length || depthLimitedNodeCount > 0,
+  };
+  return result;
 }
 
 async function getNodeInfo(nodeId, options = {}) {
@@ -525,7 +664,7 @@ async function getNodeInfo(nodeId, options = {}) {
     format: "JSON_REST_V1",
   });
 
-  return filterFigmaNode(response.document, options, node.parent?.id, indexSceneNodes(node));
+  return filterFigmaNodePage(response.document, options, node.parent?.id, indexSceneNodes(node));
 }
 
 async function getNodesInfo(nodeIds, options = {}) {
@@ -2796,7 +2935,7 @@ async function setAnnotation(params) {
  */
 async function scanNodesByTypes(params) {
   console.log(`Starting to scan nodes by types from node ID: ${params.nodeId}`);
-  const { nodeId, types = [] } = params || {};
+  const { nodeId, types = [], maxDepth } = params || {};
 
   if (!types || types.length === 0) {
     throw new Error("No types specified to search for");
@@ -2808,11 +2947,9 @@ async function scanNodesByTypes(params) {
     throw new Error(`Node with ID ${nodeId} not found`);
   }
 
-  // Simple implementation without chunking
   const matchingNodes = [];
-
-  // Send a single progress update to notify start
-  const commandId = generateCommandId();
+  const stats = { visitedNodes: 0, hiddenNodeCount: 0, depthLimitedNodeCount: 0 };
+  const commandId = params.commandId || generateCommandId();
   sendProgressUpdate(
     commandId,
     "scan_nodes_by_types",
@@ -2820,16 +2957,12 @@ async function scanNodesByTypes(params) {
     0,
     1,
     0,
-    `Starting scan of node "${node.name || nodeId}" for types: ${types.join(
-      ", "
-    )}`,
+    `Starting scan of node "${node.name || nodeId}" for types: ${types.join(", ")}`,
     null
   );
 
-  // Recursively find nodes with specified types
-  await findNodesByTypes(node, types, matchingNodes);
+  await findNodesByTypes(node, types, matchingNodes, undefined, 0, maxDepth, stats);
 
-  // Send completion update
   sendProgressUpdate(
     commandId,
     "scan_nodes_by_types",
@@ -2845,29 +2978,45 @@ async function scanNodesByTypes(params) {
     success: true,
     message: `Found ${matchingNodes.length} matching nodes.`,
     count: matchingNodes.length,
-    matchingNodes: matchingNodes,
+    matchingNodes,
     searchedTypes: types,
+    hiddenNodeCount: stats.hiddenNodeCount,
+    depthLimitedNodeCount: stats.depthLimitedNodeCount,
   };
 }
 
-/**
- * Helper function to recursively find nodes with specific types
- * @param {SceneNode} node - The root node to start searching from
- * @param {Array<string>} types - Array of node types to find
- * @param {Array} matchingNodes - Array to store found nodes
- */
-async function findNodesByTypes(node, types, matchingNodes = []) {
-  // Skip invisible nodes
-  if (node.visible === false) return;
+async function findNodesByTypes(
+  node,
+  types,
+  matchingNodes,
+  parentId,
+  depth,
+  maxDepth,
+  stats
+) {
+  stats.visitedNodes++;
+  if (stats.visitedNodes % 200 === 0) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  if (node.visible === false) {
+    stats.hiddenNodeCount += countNodeTree(node);
+    return;
+  }
+  if (maxDepth !== undefined && depth > maxDepth) {
+    stats.depthLimitedNodeCount += countNodeTree(node);
+    return;
+  }
 
-  // Check if this node is one of the specified types
   if (types.includes(node.type)) {
-    // Create a minimal representation with just ID, type and bbox
     matchingNodes.push({
       id: node.id,
+      parentId,
+      depth,
       name: node.name || `Unnamed ${node.type}`,
       type: node.type,
-      // Basic bounding box info
+      visible: node.visible,
+      childCount: "children" in node ? node.children.length : 0,
+      absoluteBoundingBox: node.absoluteBoundingBox || null,
       bbox: {
         x: typeof node.x === "number" ? node.x : 0,
         y: typeof node.y === "number" ? node.y : 0,
@@ -2877,10 +3026,9 @@ async function findNodesByTypes(node, types, matchingNodes = []) {
     });
   }
 
-  // Recursively process children of container nodes
   if ("children" in node) {
     for (const child of node.children) {
-      await findNodesByTypes(child, types, matchingNodes);
+      await findNodesByTypes(child, types, matchingNodes, node.id, depth + 1, maxDepth, stats);
     }
   }
 }

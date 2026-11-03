@@ -25,11 +25,304 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 // src/talk_to_figma_mcp/server.ts
 var import_mcp = require("@modelcontextprotocol/sdk/server/mcp.js");
 var import_stdio = require("@modelcontextprotocol/sdk/server/stdio.js");
-var import_zod = require("zod");
+var import_zod2 = require("zod");
 var import_ws = __toESM(require("ws"), 1);
 var import_uuid = require("uuid");
 var import_https = __toESM(require("https"), 1);
 var import_http = __toESM(require("http"), 1);
+
+// src/talk_to_figma_mcp/minio.ts
+var import_crypto = require("crypto");
+var import_promises = require("fs/promises");
+var import_path = __toESM(require("path"), 1);
+var import_minio = require("minio");
+var import_zod = require("zod");
+var UPLOAD_TIMEOUT_MS = 6e4;
+var MAX_IMAGE_SIZE_BYTES = 10 * 1024 * 1024;
+var projectRootSchema = import_zod.z.string().refine(import_path.default.isAbsolute, "projectRoot must be an absolute path");
+var minioConfigFields = {
+  endPoint: import_zod.z.string().trim().min(1).max(255).refine(
+    (value) => !value.includes("://") && !/[/?#\s]/.test(value),
+    "endPoint must be a hostname or IP address without protocol or path"
+  ),
+  port: import_zod.z.number().int().min(1).max(65535),
+  useSSL: import_zod.z.boolean(),
+  accessKey: import_zod.z.string().min(1).max(512),
+  secretKey: import_zod.z.string().min(1).max(1024),
+  bucket: import_zod.z.string().regex(
+    /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/,
+    "bucket must be a valid MinIO bucket name"
+  ),
+  prefix: import_zod.z.string().max(1024).refine(
+    (value) => !/[\u0000-\u001f\\]/.test(value) && !value.split("/").includes(".."),
+    "prefix contains an invalid path"
+  ),
+  publicBaseUrl: import_zod.z.string().max(2048).refine((value) => {
+    if (!value) return true;
+    try {
+      const url = new URL(value);
+      return (url.protocol === "http:" || url.protocol === "https:") && !url.username && !url.password;
+    } catch {
+      return false;
+    }
+  }, "publicBaseUrl must be an HTTP(S) URL without credentials")
+};
+var minioConfigSchema = import_zod.z.object({
+  ...minioConfigFields,
+  port: minioConfigFields.port.default(9e3),
+  useSSL: minioConfigFields.useSSL.default(false),
+  prefix: minioConfigFields.prefix.default(""),
+  publicBaseUrl: minioConfigFields.publicBaseUrl.default("")
+});
+var setMinioConfigSchema = import_zod.z.object({
+  projectRoot: projectRootSchema,
+  ...import_zod.z.object(minioConfigFields).partial().shape
+});
+async function runWithTimeout(operation, message) {
+  let timeout;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise((_, reject) => {
+        timeout = setTimeout(() => reject(new Error(message)), UPLOAD_TIMEOUT_MS);
+      })
+    ]);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+function minioOperationError(error, operation) {
+  const code = error?.code || error?.name;
+  if (["AccessDenied", "InvalidAccessKeyId", "SignatureDoesNotMatch"].includes(code)) {
+    return new Error("MinIO authentication failed; check accessKey and secretKey");
+  }
+  return new Error(`MinIO ${operation} failed${code ? ` (${code})` : ""}: ${error?.message || "Unknown error"}`);
+}
+function configPath(projectRoot) {
+  return import_path.default.join(projectRoot, "minio.json");
+}
+async function assertProjectRoot(projectRoot) {
+  projectRootSchema.parse(projectRoot);
+  let projectStat;
+  try {
+    projectStat = await (0, import_promises.stat)(projectRoot);
+  } catch {
+    throw new Error(`Project root does not exist: ${projectRoot}`);
+  }
+  if (!projectStat.isDirectory()) {
+    throw new Error(`projectRoot is not a directory: ${projectRoot}`);
+  }
+}
+async function readConfig(projectRoot) {
+  let raw;
+  try {
+    raw = await (0, import_promises.readFile)(configPath(projectRoot), "utf8");
+  } catch (error) {
+    if (error?.code === "ENOENT") return null;
+    throw new Error(`Unable to read MinIO config: ${error.message}`);
+  }
+  try {
+    return minioConfigSchema.parse(JSON.parse(raw));
+  } catch (error) {
+    if (error instanceof import_zod.z.ZodError) {
+      throw new Error(`Invalid MinIO config: ${error.issues.map((issue) => `${issue.path.join(".")}: ${issue.message}`).join("; ")}`);
+    }
+    throw new Error("Invalid MinIO config: minio.json is not valid JSON");
+  }
+}
+async function createMinioUploadContext(projectRoot) {
+  await assertProjectRoot(projectRoot);
+  const config = await readConfig(projectRoot);
+  if (!config) {
+    throw new Error(`MinIO is not configured for ${projectRoot}. Call set_minio_config first.`);
+  }
+  const client = new import_minio.Client({
+    endPoint: config.endPoint,
+    port: config.port,
+    useSSL: config.useSSL,
+    accessKey: config.accessKey,
+    secretKey: config.secretKey
+  });
+  try {
+    const bucketExists = await runWithTimeout(
+      client.bucketExists(config.bucket),
+      "MinIO preflight timed out after 60s"
+    );
+    if (!bucketExists) {
+      throw new Error(`Bucket does not exist or is not accessible: ${config.bucket}`);
+    }
+  } catch (error) {
+    throw minioOperationError(error, "preflight");
+  }
+  return { config, client };
+}
+async function ensureGitignore(projectRoot) {
+  const gitignorePath = import_path.default.join(projectRoot, ".gitignore");
+  let content = "";
+  try {
+    content = await (0, import_promises.readFile)(gitignorePath, "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+  if (content.split(/\r?\n/).some((line) => line.trim() === "minio.json")) return false;
+  const separator = content && !content.endsWith("\n") && !content.endsWith("\r") ? "\n" : "";
+  await (0, import_promises.writeFile)(gitignorePath, `${content}${separator}minio.json
+`, "utf8");
+  return true;
+}
+async function setMinioConfig(input) {
+  const { projectRoot, ...updates } = setMinioConfigSchema.parse(input);
+  await assertProjectRoot(projectRoot);
+  const existing = await readConfig(projectRoot);
+  const config = minioConfigSchema.parse({ ...existing || {}, ...updates });
+  const destination = configPath(projectRoot);
+  const temporary = import_path.default.join(projectRoot, `.minio.json.${process.pid}.${(0, import_crypto.randomUUID)()}.tmp`);
+  try {
+    await (0, import_promises.writeFile)(temporary, `${JSON.stringify(config, null, 2)}
+`, { encoding: "utf8", mode: 384 });
+    await (0, import_promises.rename)(temporary, destination);
+    await (0, import_promises.chmod)(destination, 384);
+  } catch (error) {
+    await (0, import_promises.unlink)(temporary).catch(() => void 0);
+    throw error;
+  }
+  const gitignoreUpdated = await ensureGitignore(projectRoot);
+  return {
+    success: true,
+    configPath: destination,
+    gitignoreUpdated,
+    config: {
+      endPoint: config.endPoint,
+      port: config.port,
+      useSSL: config.useSSL,
+      bucket: config.bucket,
+      prefix: config.prefix,
+      publicBaseUrl: config.publicBaseUrl,
+      credentialsConfigured: true
+    }
+  };
+}
+function normalizePrefix(prefix) {
+  const normalized = prefix.replace(/^\/+/, "");
+  return normalized && !normalized.endsWith("/") ? `${normalized}/` : normalized;
+}
+function buildObjectName(prefix, filename, extension) {
+  const basename = import_path.default.basename((filename || "figma-export").replace(/\\/g, "/"));
+  const currentExtension = import_path.default.extname(basename);
+  const stem = (currentExtension ? basename.slice(0, -currentExtension.length) : basename).replace(/[\u0000-\u001f]/g, "_").trim().slice(0, 120) || "figma-export";
+  return `${normalizePrefix(prefix)}${stem}-${Date.now()}-${(0, import_crypto.randomUUID)()}.${extension}`;
+}
+function buildPublicUrl(config, objectName) {
+  const encodedObjectName = objectName.split("/").map(encodeURIComponent).join("/");
+  if (config.publicBaseUrl) {
+    return `${config.publicBaseUrl.replace(/\/+$/, "")}/${encodedObjectName}`;
+  }
+  const protocol = config.useSSL ? "https" : "http";
+  const portPart = config.useSSL && config.port === 443 || !config.useSSL && config.port === 80 ? "" : `:${config.port}`;
+  return `${protocol}://${config.endPoint}${portPart}/${config.bucket}/${encodedObjectName}`;
+}
+var imageMimeTypes = {
+  PNG: "image/png",
+  JPG: "image/jpeg",
+  GIF: "image/gif",
+  WEBP: "image/webp",
+  SVG: "image/svg+xml",
+  PDF: "application/pdf"
+};
+function validateImage(imageData, format, mimeType) {
+  const expectedMimeType = imageMimeTypes[format];
+  if (!expectedMimeType) throw new Error(`Unsupported image format: ${format}`);
+  if (mimeType && mimeType !== expectedMimeType) {
+    throw new Error(`Image MIME type ${mimeType} does not match format ${format}`);
+  }
+  const buffer = Buffer.isBuffer(imageData) ? imageData : Buffer.from(imageData, "base64");
+  if (!buffer.length) throw new Error("Image is empty");
+  if (buffer.length > MAX_IMAGE_SIZE_BYTES) {
+    throw new Error(`Image exceeds the ${MAX_IMAGE_SIZE_BYTES / 1024 / 1024}MB upload limit`);
+  }
+  return buffer;
+}
+function detectLocalImage(buffer) {
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+    return { format: "PNG", mimeType: imageMimeTypes.PNG };
+  }
+  if (buffer.length >= 3 && buffer[0] === 255 && buffer[1] === 216 && buffer[2] === 255) {
+    return { format: "JPG", mimeType: imageMimeTypes.JPG };
+  }
+  const header = buffer.subarray(0, 12).toString("ascii");
+  if (header.startsWith("GIF87a") || header.startsWith("GIF89a")) {
+    return { format: "GIF", mimeType: imageMimeTypes.GIF };
+  }
+  if (header.startsWith("RIFF") && header.slice(8, 12) === "WEBP") {
+    return { format: "WEBP", mimeType: imageMimeTypes.WEBP };
+  }
+  if (buffer.subarray(0, 5).toString("ascii") === "%PDF-") {
+    return { format: "PDF", mimeType: imageMimeTypes.PDF };
+  }
+  const text = buffer.subarray(0, 4096).toString("utf8").replace(/^\uFEFF/, "").trimStart();
+  if (/^(?:<\?xml[\s\S]*?\?>\s*)?(?:<!--[\s\S]*?-->\s*)*<svg(?:\s|>)/i.test(text)) {
+    return { format: "SVG", mimeType: imageMimeTypes.SVG };
+  }
+  throw new Error("Unsupported local image; expected PNG, JPG, GIF, WEBP, SVG, or PDF content");
+}
+async function readLocalImage(filePath) {
+  let fileStat;
+  try {
+    fileStat = await (0, import_promises.stat)(filePath);
+  } catch (error) {
+    if (error?.code === "ENOENT") throw new Error(`Local image does not exist: ${filePath}`);
+    throw new Error(`Unable to access local image: ${error?.message || "Unknown error"}`);
+  }
+  if (!fileStat.isFile()) throw new Error(`Local image path is not a file: ${filePath}`);
+  if (fileStat.size > MAX_IMAGE_SIZE_BYTES) {
+    throw new Error(`Local image exceeds the ${MAX_IMAGE_SIZE_BYTES / 1024 / 1024}MB upload limit: ${filePath}`);
+  }
+  const buffer = await (0, import_promises.readFile)(filePath);
+  if (!buffer.length) throw new Error(`Local image is empty: ${filePath}`);
+  return { buffer, ...detectLocalImage(buffer) };
+}
+async function uploadLocalImageToMinio(options) {
+  await assertProjectRoot(options.projectRoot);
+  const localPath = import_path.default.isAbsolute(options.path) ? import_path.default.normalize(options.path) : import_path.default.resolve(options.projectRoot, options.path);
+  const { buffer, format, mimeType } = await readLocalImage(localPath);
+  const result = await uploadImageToMinio({
+    projectRoot: options.projectRoot,
+    imageData: buffer,
+    mimeType,
+    format,
+    filename: options.filename || import_path.default.basename(localPath),
+    context: options.context
+  });
+  return { ...result, localPath };
+}
+async function uploadImageToMinio(options) {
+  await assertProjectRoot(options.projectRoot);
+  const { config, client } = options.context || await createMinioUploadContext(options.projectRoot);
+  const format = (options.format || "PNG").toUpperCase();
+  const buffer = validateImage(options.imageData, format, options.mimeType);
+  const extension = format === "JPG" ? "jpg" : format.toLowerCase();
+  const objectName = buildObjectName(config.prefix, options.filename, extension);
+  const mimeType = options.mimeType || imageMimeTypes[format];
+  try {
+    await runWithTimeout(
+      client.putObject(config.bucket, objectName, buffer, buffer.length, { "Content-Type": mimeType }),
+      "MinIO upload timed out after 60s"
+    );
+  } catch (error) {
+    throw minioOperationError(error, "upload");
+  }
+  return {
+    imageUrl: buildPublicUrl(config, objectName),
+    bucket: config.bucket,
+    objectName,
+    mimeType,
+    format,
+    scale: options.scale ?? 1,
+    size: buffer.length
+  };
+}
+
+// src/talk_to_figma_mcp/server.ts
 var logger = {
   info: (message) => process.stderr.write(`[INFO] ${message}
 `),
@@ -125,7 +418,7 @@ server.tool(
   "read_my_design",
   "Get detailed information about the current selection in Figma, including all node details",
   {
-    includeGeometry: import_zod.z.boolean().optional().describe("Include vector paths and geometry data when present")
+    includeGeometry: import_zod2.z.boolean().optional().describe("Include vector paths and geometry data when present")
   },
   async ({ includeGeometry }) => {
     try {
@@ -150,16 +443,23 @@ server.tool(
     }
   }
 );
+var nodeReadToolOptions = {
+  includeGeometry: import_zod2.z.boolean().optional().describe("Include vector paths and geometry data when present"),
+  maxDepth: import_zod2.z.number().int().min(0).max(50).optional().describe("Maximum descendant depth relative to the requested root; omit for unlimited depth"),
+  includeHidden: import_zod2.z.boolean().optional().describe("Include hidden subtrees; defaults to false"),
+  maxNodes: import_zod2.z.number().int().min(1).max(1e3).optional().describe("Maximum non-root nodes returned per page; defaults to 300"),
+  cursor: import_zod2.z.string().regex(/^\d+$/).optional().describe("Use the previous response's page.nextCursor with unchanged read options")
+};
 server.tool(
   "get_node_info",
-  "Get detailed information about a specific node in Figma",
+  "Get detailed information about a specific node in Figma. Hidden subtrees are excluded by default and results are paginated; follow page.nextCursor until null and merge repeated ancestor nodes by ID.",
   {
-    nodeId: import_zod.z.string().describe("The ID of the node to get information about"),
-    includeGeometry: import_zod.z.boolean().optional().describe("Include vector paths and geometry data when present")
+    nodeId: import_zod2.z.string().describe("The ID of the node to get information about"),
+    ...nodeReadToolOptions
   },
-  async ({ nodeId, includeGeometry }) => {
+  async (input) => {
     try {
-      const result = await sendCommandToFigma("get_node_info", { nodeId, includeGeometry });
+      const result = await sendCommandToFigma("get_node_info", input);
       return {
         content: [
           {
@@ -182,19 +482,18 @@ server.tool(
 );
 server.tool(
   "get_nodes_info",
-  "Get detailed information about multiple nodes in Figma",
+  "Get detailed information about multiple nodes in Figma sequentially to avoid concurrent Figma exports. Each node follows the same pagination contract as get_node_info.",
   {
-    nodeIds: import_zod.z.array(import_zod.z.string()).describe("Array of node IDs to get information about"),
-    includeGeometry: import_zod.z.boolean().optional().describe("Include vector paths and geometry data when present")
+    nodeIds: import_zod2.z.array(import_zod2.z.string()).min(1).max(20).describe("Array of node IDs to get information about; maximum 20 per call"),
+    ...nodeReadToolOptions
   },
-  async ({ nodeIds, includeGeometry }) => {
+  async ({ nodeIds, ...options }) => {
     try {
-      const results = await Promise.all(
-        nodeIds.map(async (nodeId) => {
-          const result = await sendCommandToFigma("get_node_info", { nodeId, includeGeometry });
-          return { nodeId, info: result };
-        })
-      );
+      const results = [];
+      for (const nodeId of nodeIds) {
+        const result = await sendCommandToFigma("get_node_info", { nodeId, ...options });
+        results.push({ nodeId, info: result });
+      }
       return {
         content: [
           {
@@ -219,12 +518,12 @@ server.tool(
   "create_rectangle",
   "Create a new rectangle in Figma",
   {
-    x: import_zod.z.number().describe("X position"),
-    y: import_zod.z.number().describe("Y position"),
-    width: import_zod.z.number().describe("Width of the rectangle"),
-    height: import_zod.z.number().describe("Height of the rectangle"),
-    name: import_zod.z.string().optional().describe("Optional name for the rectangle"),
-    parentId: import_zod.z.string().optional().describe("Optional parent node ID to append the rectangle to")
+    x: import_zod2.z.number().describe("X position"),
+    y: import_zod2.z.number().describe("Y position"),
+    width: import_zod2.z.number().describe("Width of the rectangle"),
+    height: import_zod2.z.number().describe("Height of the rectangle"),
+    name: import_zod2.z.string().optional().describe("Optional name for the rectangle"),
+    parentId: import_zod2.z.string().optional().describe("Optional parent node ID to append the rectangle to")
   },
   async ({ x, y, width, height, name, parentId }) => {
     try {
@@ -260,36 +559,36 @@ server.tool(
   "create_frame",
   "Create a new frame in Figma",
   {
-    x: import_zod.z.number().describe("X position"),
-    y: import_zod.z.number().describe("Y position"),
-    width: import_zod.z.number().describe("Width of the frame"),
-    height: import_zod.z.number().describe("Height of the frame"),
-    name: import_zod.z.string().optional().describe("Optional name for the frame"),
-    parentId: import_zod.z.string().optional().describe("Optional parent node ID to append the frame to"),
-    fillColor: import_zod.z.object({
-      r: import_zod.z.number().min(0).max(1).describe("Red component (0-1)"),
-      g: import_zod.z.number().min(0).max(1).describe("Green component (0-1)"),
-      b: import_zod.z.number().min(0).max(1).describe("Blue component (0-1)"),
-      a: import_zod.z.number().min(0).max(1).optional().describe("Alpha component (0-1)")
+    x: import_zod2.z.number().describe("X position"),
+    y: import_zod2.z.number().describe("Y position"),
+    width: import_zod2.z.number().describe("Width of the frame"),
+    height: import_zod2.z.number().describe("Height of the frame"),
+    name: import_zod2.z.string().optional().describe("Optional name for the frame"),
+    parentId: import_zod2.z.string().optional().describe("Optional parent node ID to append the frame to"),
+    fillColor: import_zod2.z.object({
+      r: import_zod2.z.number().min(0).max(1).describe("Red component (0-1)"),
+      g: import_zod2.z.number().min(0).max(1).describe("Green component (0-1)"),
+      b: import_zod2.z.number().min(0).max(1).describe("Blue component (0-1)"),
+      a: import_zod2.z.number().min(0).max(1).optional().describe("Alpha component (0-1)")
     }).optional().describe("Fill color in RGBA format"),
-    strokeColor: import_zod.z.object({
-      r: import_zod.z.number().min(0).max(1).describe("Red component (0-1)"),
-      g: import_zod.z.number().min(0).max(1).describe("Green component (0-1)"),
-      b: import_zod.z.number().min(0).max(1).describe("Blue component (0-1)"),
-      a: import_zod.z.number().min(0).max(1).optional().describe("Alpha component (0-1)")
+    strokeColor: import_zod2.z.object({
+      r: import_zod2.z.number().min(0).max(1).describe("Red component (0-1)"),
+      g: import_zod2.z.number().min(0).max(1).describe("Green component (0-1)"),
+      b: import_zod2.z.number().min(0).max(1).describe("Blue component (0-1)"),
+      a: import_zod2.z.number().min(0).max(1).optional().describe("Alpha component (0-1)")
     }).optional().describe("Stroke color in RGBA format"),
-    strokeWeight: import_zod.z.number().positive().optional().describe("Stroke weight"),
-    layoutMode: import_zod.z.enum(["NONE", "HORIZONTAL", "VERTICAL"]).optional().describe("Auto-layout mode for the frame"),
-    layoutWrap: import_zod.z.enum(["NO_WRAP", "WRAP"]).optional().describe("Whether the auto-layout frame wraps its children"),
-    paddingTop: import_zod.z.number().optional().describe("Top padding for auto-layout frame"),
-    paddingRight: import_zod.z.number().optional().describe("Right padding for auto-layout frame"),
-    paddingBottom: import_zod.z.number().optional().describe("Bottom padding for auto-layout frame"),
-    paddingLeft: import_zod.z.number().optional().describe("Left padding for auto-layout frame"),
-    primaryAxisAlignItems: import_zod.z.enum(["MIN", "MAX", "CENTER", "SPACE_BETWEEN"]).optional().describe("Primary axis alignment for auto-layout frame. Note: When set to SPACE_BETWEEN, itemSpacing will be ignored as children will be evenly spaced."),
-    counterAxisAlignItems: import_zod.z.enum(["MIN", "MAX", "CENTER", "BASELINE"]).optional().describe("Counter axis alignment for auto-layout frame"),
-    layoutSizingHorizontal: import_zod.z.enum(["FIXED", "HUG", "FILL"]).optional().describe("Horizontal sizing mode for auto-layout frame"),
-    layoutSizingVertical: import_zod.z.enum(["FIXED", "HUG", "FILL"]).optional().describe("Vertical sizing mode for auto-layout frame"),
-    itemSpacing: import_zod.z.number().optional().describe("Distance between children in auto-layout frame. Note: This value will be ignored if primaryAxisAlignItems is set to SPACE_BETWEEN.")
+    strokeWeight: import_zod2.z.number().positive().optional().describe("Stroke weight"),
+    layoutMode: import_zod2.z.enum(["NONE", "HORIZONTAL", "VERTICAL"]).optional().describe("Auto-layout mode for the frame"),
+    layoutWrap: import_zod2.z.enum(["NO_WRAP", "WRAP"]).optional().describe("Whether the auto-layout frame wraps its children"),
+    paddingTop: import_zod2.z.number().optional().describe("Top padding for auto-layout frame"),
+    paddingRight: import_zod2.z.number().optional().describe("Right padding for auto-layout frame"),
+    paddingBottom: import_zod2.z.number().optional().describe("Bottom padding for auto-layout frame"),
+    paddingLeft: import_zod2.z.number().optional().describe("Left padding for auto-layout frame"),
+    primaryAxisAlignItems: import_zod2.z.enum(["MIN", "MAX", "CENTER", "SPACE_BETWEEN"]).optional().describe("Primary axis alignment for auto-layout frame. Note: When set to SPACE_BETWEEN, itemSpacing will be ignored as children will be evenly spaced."),
+    counterAxisAlignItems: import_zod2.z.enum(["MIN", "MAX", "CENTER", "BASELINE"]).optional().describe("Counter axis alignment for auto-layout frame"),
+    layoutSizingHorizontal: import_zod2.z.enum(["FIXED", "HUG", "FILL"]).optional().describe("Horizontal sizing mode for auto-layout frame"),
+    layoutSizingVertical: import_zod2.z.enum(["FIXED", "HUG", "FILL"]).optional().describe("Vertical sizing mode for auto-layout frame"),
+    itemSpacing: import_zod2.z.number().optional().describe("Distance between children in auto-layout frame. Note: This value will be ignored if primaryAxisAlignItems is set to SPACE_BETWEEN.")
   },
   async ({
     x,
@@ -361,19 +660,19 @@ server.tool(
   "create_text",
   "Create a new text element in Figma",
   {
-    x: import_zod.z.number().describe("X position"),
-    y: import_zod.z.number().describe("Y position"),
-    text: import_zod.z.string().describe("Text content"),
-    fontSize: import_zod.z.number().optional().describe("Font size (default: 14)"),
-    fontWeight: import_zod.z.number().optional().describe("Font weight (e.g., 400 for Regular, 700 for Bold)"),
-    fontColor: import_zod.z.object({
-      r: import_zod.z.number().min(0).max(1).describe("Red component (0-1)"),
-      g: import_zod.z.number().min(0).max(1).describe("Green component (0-1)"),
-      b: import_zod.z.number().min(0).max(1).describe("Blue component (0-1)"),
-      a: import_zod.z.number().min(0).max(1).optional().describe("Alpha component (0-1)")
+    x: import_zod2.z.number().describe("X position"),
+    y: import_zod2.z.number().describe("Y position"),
+    text: import_zod2.z.string().describe("Text content"),
+    fontSize: import_zod2.z.number().optional().describe("Font size (default: 14)"),
+    fontWeight: import_zod2.z.number().optional().describe("Font weight (e.g., 400 for Regular, 700 for Bold)"),
+    fontColor: import_zod2.z.object({
+      r: import_zod2.z.number().min(0).max(1).describe("Red component (0-1)"),
+      g: import_zod2.z.number().min(0).max(1).describe("Green component (0-1)"),
+      b: import_zod2.z.number().min(0).max(1).describe("Blue component (0-1)"),
+      a: import_zod2.z.number().min(0).max(1).optional().describe("Alpha component (0-1)")
     }).optional().describe("Font color in RGBA format"),
-    name: import_zod.z.string().optional().describe("Semantic layer name for the text node"),
-    parentId: import_zod.z.string().optional().describe("Optional parent node ID to append the text to")
+    name: import_zod2.z.string().optional().describe("Semantic layer name for the text node"),
+    parentId: import_zod2.z.string().optional().describe("Optional parent node ID to append the text to")
   },
   async ({ x, y, text, fontSize, fontWeight, fontColor, name, parentId }) => {
     try {
@@ -412,11 +711,11 @@ server.tool(
   "set_fill_color",
   "Set the fill color of a node in Figma can be TextNode or FrameNode",
   {
-    nodeId: import_zod.z.string().describe("The ID of the node to modify"),
-    r: import_zod.z.number().min(0).max(1).describe("Red component (0-1)"),
-    g: import_zod.z.number().min(0).max(1).describe("Green component (0-1)"),
-    b: import_zod.z.number().min(0).max(1).describe("Blue component (0-1)"),
-    a: import_zod.z.number().min(0).max(1).optional().describe("Alpha component (0-1)")
+    nodeId: import_zod2.z.string().describe("The ID of the node to modify"),
+    r: import_zod2.z.number().min(0).max(1).describe("Red component (0-1)"),
+    g: import_zod2.z.number().min(0).max(1).describe("Green component (0-1)"),
+    b: import_zod2.z.number().min(0).max(1).describe("Blue component (0-1)"),
+    a: import_zod2.z.number().min(0).max(1).optional().describe("Alpha component (0-1)")
   },
   async ({ nodeId, r, g, b, a }) => {
     try {
@@ -449,12 +748,12 @@ server.tool(
   "set_stroke_color",
   "Set the stroke color of a node in Figma",
   {
-    nodeId: import_zod.z.string().describe("The ID of the node to modify"),
-    r: import_zod.z.number().min(0).max(1).describe("Red component (0-1)"),
-    g: import_zod.z.number().min(0).max(1).describe("Green component (0-1)"),
-    b: import_zod.z.number().min(0).max(1).describe("Blue component (0-1)"),
-    a: import_zod.z.number().min(0).max(1).optional().describe("Alpha component (0-1)"),
-    weight: import_zod.z.number().positive().optional().describe("Stroke weight")
+    nodeId: import_zod2.z.string().describe("The ID of the node to modify"),
+    r: import_zod2.z.number().min(0).max(1).describe("Red component (0-1)"),
+    g: import_zod2.z.number().min(0).max(1).describe("Green component (0-1)"),
+    b: import_zod2.z.number().min(0).max(1).describe("Blue component (0-1)"),
+    a: import_zod2.z.number().min(0).max(1).optional().describe("Alpha component (0-1)"),
+    weight: import_zod2.z.number().positive().optional().describe("Stroke weight")
   },
   async ({ nodeId, r, g, b, a, weight }) => {
     try {
@@ -488,9 +787,9 @@ server.tool(
   "move_node",
   "Move a node to a new position in Figma",
   {
-    nodeId: import_zod.z.string().describe("The ID of the node to move"),
-    x: import_zod.z.number().describe("New X position"),
-    y: import_zod.z.number().describe("New Y position")
+    nodeId: import_zod2.z.string().describe("The ID of the node to move"),
+    x: import_zod2.z.number().describe("New X position"),
+    y: import_zod2.z.number().describe("New Y position")
   },
   async ({ nodeId, x, y }) => {
     try {
@@ -520,9 +819,9 @@ server.tool(
   "clone_node",
   "Clone an existing node in Figma",
   {
-    nodeId: import_zod.z.string().describe("The ID of the node to clone"),
-    x: import_zod.z.number().optional().describe("New X position for the clone"),
-    y: import_zod.z.number().optional().describe("New Y position for the clone")
+    nodeId: import_zod2.z.string().describe("The ID of the node to clone"),
+    x: import_zod2.z.number().optional().describe("New X position for the clone"),
+    y: import_zod2.z.number().optional().describe("New Y position for the clone")
   },
   async ({ nodeId, x, y }) => {
     try {
@@ -552,9 +851,9 @@ server.tool(
   "resize_node",
   "Resize a node in Figma",
   {
-    nodeId: import_zod.z.string().describe("The ID of the node to resize"),
-    width: import_zod.z.number().positive().describe("New width"),
-    height: import_zod.z.number().positive().describe("New height")
+    nodeId: import_zod2.z.string().describe("The ID of the node to resize"),
+    width: import_zod2.z.number().positive().describe("New width"),
+    height: import_zod2.z.number().positive().describe("New height")
   },
   async ({ nodeId, width, height }) => {
     try {
@@ -588,7 +887,7 @@ server.tool(
   "delete_node",
   "Delete a node from Figma",
   {
-    nodeId: import_zod.z.string().describe("The ID of the node to delete")
+    nodeId: import_zod2.z.string().describe("The ID of the node to delete")
   },
   async ({ nodeId }) => {
     try {
@@ -617,7 +916,7 @@ server.tool(
   "delete_multiple_nodes",
   "Delete multiple nodes from Figma at once",
   {
-    nodeIds: import_zod.z.array(import_zod.z.string()).describe("Array of node IDs to delete")
+    nodeIds: import_zod2.z.array(import_zod2.z.string()).describe("Array of node IDs to delete")
   },
   async ({ nodeIds }) => {
     try {
@@ -646,9 +945,9 @@ server.tool(
   "export_node_as_image",
   "Export a node as an image from Figma",
   {
-    nodeId: import_zod.z.string().describe("The ID of the node to export"),
-    format: import_zod.z.enum(["PNG", "JPG", "SVG", "PDF"]).optional().describe("Export format"),
-    scale: import_zod.z.number().positive().optional().describe("Export scale")
+    nodeId: import_zod2.z.string().describe("The ID of the node to export"),
+    format: import_zod2.z.enum(["PNG", "JPG", "SVG", "PDF"]).optional().describe("Export format"),
+    scale: import_zod2.z.number().positive().optional().describe("Export scale")
   },
   async ({ nodeId, format, scale }) => {
     try {
@@ -680,17 +979,152 @@ server.tool(
   }
 );
 server.tool(
-  "export_and_upload_image",
-  "Export a node as an image from Figma and upload it to a remote server. The upload is performed by the MCP server (Node.js) so it can bypass browser certificate restrictions.",
+  "set_minio_config",
+  "Create or update minio.json in an absolute project root for direct MinIO image uploads. Existing values are preserved when fields are omitted. Credentials are never returned.",
   {
-    nodeId: import_zod.z.string().describe("The ID of the node to export"),
-    uploadUrl: import_zod.z.string().describe("The URL to upload the image to (e.g. https://192.168.3.11:3000/api/upload-base64)"),
-    format: import_zod.z.enum(["PNG", "JPG", "SVG", "PDF"]).optional().describe("Export format"),
-    scale: import_zod.z.number().positive().optional().describe("Export scale"),
-    filename: import_zod.z.string().optional().describe("Optional filename for the uploaded image")
+    projectRoot: import_zod2.z.string().describe("Absolute path to the target project containing minio.json"),
+    ...import_zod2.z.object(minioConfigFields).partial().shape
   },
-  async ({ nodeId, uploadUrl, format, scale, filename }) => {
+  async (input) => {
     try {
+      const result = await setMinioConfig(input);
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
+      };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `Error setting MinIO config: ${error instanceof Error ? error.message : String(error)}`
+        }]
+      };
+    }
+  }
+);
+var uploadImageItemSchema = import_zod2.z.discriminatedUnion("source", [
+  import_zod2.z.object({
+    source: import_zod2.z.literal("figma"),
+    nodeId: import_zod2.z.string().min(1).describe("The ID of the Figma node to export"),
+    format: import_zod2.z.enum(["PNG", "JPG", "SVG", "PDF"]).optional().describe("Figma export format; defaults to PNG"),
+    scale: import_zod2.z.number().positive().optional().describe("Figma export scale; defaults to 1"),
+    filename: import_zod2.z.string().min(1).max(255).optional().describe("Optional semantic filename; extension is normalized to the actual format")
+  }).strict(),
+  import_zod2.z.object({
+    source: import_zod2.z.literal("local"),
+    path: import_zod2.z.string().min(1).max(4096).describe("Absolute local image path, or a path relative to projectRoot"),
+    filename: import_zod2.z.string().min(1).max(255).optional().describe("Optional semantic filename; defaults to the local filename")
+  }).strict()
+]);
+async function uploadImageItemToMinio(projectRoot, item, context) {
+  const uploadContext = context || await createMinioUploadContext(projectRoot);
+  if (item.source === "local") {
+    return uploadLocalImageToMinio({
+      projectRoot,
+      path: item.path,
+      filename: item.filename,
+      context: uploadContext
+    });
+  }
+  const exportResult = await sendCommandToFigma("export_node_as_image", {
+    nodeId: item.nodeId,
+    format: item.format || "PNG",
+    scale: item.scale || 1
+  });
+  const { imageData, mimeType, format: exportedFormat = "PNG" } = exportResult;
+  return uploadImageToMinio({
+    projectRoot,
+    imageData,
+    mimeType,
+    format: exportedFormat,
+    filename: item.filename,
+    scale: item.scale,
+    context: uploadContext
+  });
+}
+server.tool(
+  "upload_images",
+  "Validate projectRoot/minio.json and bucket access before exporting any images, then upload up to 20 Figma node exports and/or local images sequentially. Shared preflight failures stop the batch before Figma export; item failures are isolated.",
+  {
+    projectRoot: import_zod2.z.string().describe("Absolute path to the project containing minio.json"),
+    items: import_zod2.z.array(uploadImageItemSchema).min(1).max(20).describe("Figma and local images to upload sequentially")
+  },
+  async ({ projectRoot, items }) => {
+    const uploadItems = items;
+    let context;
+    try {
+      context = await createMinioUploadContext(projectRoot);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const results2 = uploadItems.map((item, index) => ({
+        index,
+        source: item.source,
+        ...item.source === "figma" ? { nodeId: item.nodeId } : { path: item.path },
+        success: false,
+        error: `Upload preflight failed: ${message}`
+      }));
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({ success: false, total: results2.length, succeeded: 0, failed: results2.length, results: results2 }, null, 2)
+        }],
+        isError: true
+      };
+    }
+    const results = [];
+    for (const [index, item] of uploadItems.entries()) {
+      const identity = item.source === "figma" ? { nodeId: item.nodeId } : { path: item.path };
+      try {
+        const result = await uploadImageItemToMinio(projectRoot, item, context);
+        results.push({ index, source: item.source, ...identity, success: true, ...result });
+      } catch (error) {
+        results.push({
+          index,
+          source: item.source,
+          ...identity,
+          success: false,
+          error: error instanceof Error ? error.message : String(error)
+        });
+      }
+    }
+    const succeeded = results.filter((result) => result.success).length;
+    const failed = results.length - succeeded;
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({ success: failed === 0, total: results.length, succeeded, failed, results }, null, 2)
+      }],
+      ...succeeded === 0 ? { isError: true } : {}
+    };
+  }
+);
+server.tool(
+  "export_and_upload_image",
+  "Export a Figma node and upload it directly to MinIO using projectRoot/minio.json. The legacy uploadUrl HTTP endpoint remains supported. Pass exactly one of projectRoot or uploadUrl.",
+  {
+    nodeId: import_zod2.z.string().describe("The ID of the node to export"),
+    projectRoot: import_zod2.z.string().optional().describe("Absolute path to the project containing minio.json"),
+    uploadUrl: import_zod2.z.string().url().optional().describe("Legacy HTTP base64 upload endpoint"),
+    format: import_zod2.z.enum(["PNG", "JPG", "SVG", "PDF"]).optional().describe("Export format"),
+    scale: import_zod2.z.number().positive().optional().describe("Export scale"),
+    filename: import_zod2.z.string().optional().describe("Optional semantic filename; extension is normalized to the export format")
+  },
+  async ({ nodeId, projectRoot, uploadUrl, format, scale, filename }) => {
+    try {
+      if (!!projectRoot === !!uploadUrl) {
+        throw new Error("Pass exactly one of projectRoot or uploadUrl");
+      }
+      if (projectRoot) {
+        const result = await uploadImageItemToMinio(projectRoot, {
+          source: "figma",
+          nodeId,
+          format,
+          scale,
+          filename
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result) }]
+        };
+      }
       const exportResult = await sendCommandToFigma("export_node_as_image", {
         nodeId,
         format: format || "PNG",
@@ -790,8 +1224,8 @@ server.tool(
   "set_text_content",
   "Set the text content of an existing text node in Figma",
   {
-    nodeId: import_zod.z.string().describe("The ID of the text node to modify"),
-    text: import_zod.z.string().describe("New text content")
+    nodeId: import_zod2.z.string().describe("The ID of the text node to modify"),
+    text: import_zod2.z.string().describe("New text content")
   },
   async ({ nodeId, text }) => {
     try {
@@ -878,8 +1312,8 @@ server.tool(
   "get_annotations",
   "Get all annotations in the current document or specific node",
   {
-    nodeId: import_zod.z.string().describe("node ID to get annotations for specific node"),
-    includeCategories: import_zod.z.boolean().optional().default(true).describe("Whether to include category information")
+    nodeId: import_zod2.z.string().describe("node ID to get annotations for specific node"),
+    includeCategories: import_zod2.z.boolean().optional().default(true).describe("Whether to include category information")
   },
   async ({ nodeId, includeCategories }) => {
     try {
@@ -911,12 +1345,12 @@ server.tool(
   "set_annotation",
   "Create or update an annotation",
   {
-    nodeId: import_zod.z.string().describe("The ID of the node to annotate"),
-    annotationId: import_zod.z.string().optional().describe("The ID of the annotation to update (if updating existing annotation)"),
-    labelMarkdown: import_zod.z.string().describe("The annotation text in markdown format"),
-    categoryId: import_zod.z.string().optional().describe("The ID of the annotation category"),
-    properties: import_zod.z.array(import_zod.z.object({
-      type: import_zod.z.string()
+    nodeId: import_zod2.z.string().describe("The ID of the node to annotate"),
+    annotationId: import_zod2.z.string().optional().describe("The ID of the annotation to update (if updating existing annotation)"),
+    labelMarkdown: import_zod2.z.string().describe("The annotation text in markdown format"),
+    categoryId: import_zod2.z.string().optional().describe("The ID of the annotation category"),
+    properties: import_zod2.z.array(import_zod2.z.object({
+      type: import_zod2.z.string()
     })).optional().describe("Additional properties for the annotation")
   },
   async ({ nodeId, annotationId, labelMarkdown, categoryId, properties }) => {
@@ -952,15 +1386,15 @@ server.tool(
   "set_multiple_annotations",
   "Set multiple annotations parallelly in a node",
   {
-    nodeId: import_zod.z.string().describe("The ID of the node containing the elements to annotate"),
-    annotations: import_zod.z.array(
-      import_zod.z.object({
-        nodeId: import_zod.z.string().describe("The ID of the node to annotate"),
-        labelMarkdown: import_zod.z.string().describe("The annotation text in markdown format"),
-        categoryId: import_zod.z.string().optional().describe("The ID of the annotation category"),
-        annotationId: import_zod.z.string().optional().describe("The ID of the annotation to update (if updating existing annotation)"),
-        properties: import_zod.z.array(import_zod.z.object({
-          type: import_zod.z.string()
+    nodeId: import_zod2.z.string().describe("The ID of the node containing the elements to annotate"),
+    annotations: import_zod2.z.array(
+      import_zod2.z.object({
+        nodeId: import_zod2.z.string().describe("The ID of the node to annotate"),
+        labelMarkdown: import_zod2.z.string().describe("The annotation text in markdown format"),
+        categoryId: import_zod2.z.string().optional().describe("The ID of the annotation category"),
+        annotationId: import_zod2.z.string().optional().describe("The ID of the annotation to update (if updating existing annotation)"),
+        properties: import_zod2.z.array(import_zod2.z.object({
+          type: import_zod2.z.string()
         })).optional().describe("Additional properties for the annotation")
       })
     ).describe("Array of annotations to apply")
@@ -1031,11 +1465,11 @@ server.tool(
   "create_component_instance",
   "Create an instance of a component in Figma. For LOCAL components (from get_local_components), use componentId with the id field. For published LIBRARY components, use componentKey with the publishedKey field.",
   {
-    componentId: import_zod.z.string().optional().describe("ID of a local component (use the id field from get_local_components result). Use this for unpublished/local components."),
-    componentKey: import_zod.z.string().optional().describe("Key of a published library component to instantiate (use the publishedKey field from get_local_components result). Only works for published components."),
-    x: import_zod.z.number().describe("X position"),
-    y: import_zod.z.number().describe("Y position"),
-    parentId: import_zod.z.string().optional().describe("Optional parent node ID to place the instance into")
+    componentId: import_zod2.z.string().optional().describe("ID of a local component (use the id field from get_local_components result). Use this for unpublished/local components."),
+    componentKey: import_zod2.z.string().optional().describe("Key of a published library component to instantiate (use the publishedKey field from get_local_components result). Only works for published components."),
+    x: import_zod2.z.number().describe("X position"),
+    y: import_zod2.z.number().describe("Y position"),
+    parentId: import_zod2.z.string().optional().describe("Optional parent node ID to place the instance into")
   },
   async ({ componentId, componentKey, x, y, parentId }) => {
     try {
@@ -1071,7 +1505,7 @@ server.tool(
   "get_instance_overrides",
   "Get all override properties from a selected component instance. These overrides can be applied to other instances, which will swap them to match the source component.",
   {
-    nodeId: import_zod.z.string().optional().describe("Optional ID of the component instance to get overrides from. If not provided, currently selected instance will be used.")
+    nodeId: import_zod2.z.string().optional().describe("Optional ID of the component instance to get overrides from. If not provided, currently selected instance will be used.")
   },
   async ({ nodeId }) => {
     try {
@@ -1103,8 +1537,8 @@ server.tool(
   "set_instance_overrides",
   "Apply previously copied overrides to selected component instances. Target instances will be swapped to the source component and all copied override properties will be applied.",
   {
-    sourceInstanceId: import_zod.z.string().describe("ID of the source component instance"),
-    targetNodeIds: import_zod.z.array(import_zod.z.string()).describe("Array of target instance IDs. Currently selected instances will be used.")
+    sourceInstanceId: import_zod2.z.string().describe("ID of the source component instance"),
+    targetNodeIds: import_zod2.z.array(import_zod2.z.string()).describe("Array of target instance IDs. Currently selected instances will be used.")
   },
   async ({ sourceInstanceId, targetNodeIds }) => {
     try {
@@ -1149,9 +1583,9 @@ server.tool(
   "set_corner_radius",
   "Set the corner radius of a node in Figma",
   {
-    nodeId: import_zod.z.string().describe("The ID of the node to modify"),
-    radius: import_zod.z.number().min(0).describe("Corner radius value"),
-    corners: import_zod.z.array(import_zod.z.boolean()).length(4).optional().describe(
+    nodeId: import_zod2.z.string().describe("The ID of the node to modify"),
+    radius: import_zod2.z.number().min(0).describe("Corner radius value"),
+    corners: import_zod2.z.array(import_zod2.z.boolean()).length(4).optional().describe(
       "Optional array of 4 booleans to specify which corners to round [topLeft, topRight, bottomRight, bottomLeft]"
     )
   },
@@ -1296,7 +1730,7 @@ server.tool(
   "scan_text_nodes",
   "Scan all text nodes in the selected Figma node",
   {
-    nodeId: import_zod.z.string().describe("ID of the node to scan")
+    nodeId: import_zod2.z.string().describe("ID of the node to scan")
   },
   async ({ nodeId }) => {
     try {
@@ -1355,12 +1789,13 @@ server.tool(
 );
 server.tool(
   "scan_nodes_by_types",
-  "Scan for child nodes with specific types in the selected Figma node",
+  "Scan child nodes with specific types and return parentId, depth, absoluteBoundingBox, visibility, and child counts. Hidden subtrees are excluded and counted.",
   {
-    nodeId: import_zod.z.string().describe("ID of the node to scan"),
-    types: import_zod.z.array(import_zod.z.string()).describe("Array of node types to find in the child nodes (e.g. ['COMPONENT', 'FRAME'])")
+    nodeId: import_zod2.z.string().describe("ID of the node to scan"),
+    types: import_zod2.z.array(import_zod2.z.string()).describe("Array of node types to find in the child nodes (e.g. ['COMPONENT', 'FRAME'])"),
+    maxDepth: import_zod2.z.number().int().min(0).max(50).optional().describe("Maximum depth relative to the scanned root; omit for unlimited depth")
   },
-  async ({ nodeId, types }) => {
+  async ({ nodeId, types, maxDepth }) => {
     try {
       const initialStatus = {
         type: "text",
@@ -1368,7 +1803,8 @@ server.tool(
       };
       const result = await sendCommandToFigma("scan_nodes_by_types", {
         nodeId,
-        types
+        types,
+        maxDepth
       });
       if (result && typeof result === "object" && "matchingNodes" in result) {
         const typedResult = result;
@@ -1382,7 +1818,7 @@ server.tool(
             },
             {
               type: "text",
-              text: JSON.stringify(typedResult.matchingNodes, null, 2)
+              text: JSON.stringify(typedResult, null, 2)
             }
           ]
         };
@@ -1544,11 +1980,11 @@ server.tool(
   "set_multiple_text_contents",
   "Set multiple text contents parallelly in a node",
   {
-    nodeId: import_zod.z.string().describe("The ID of the node containing the text nodes to replace"),
-    text: import_zod.z.array(
-      import_zod.z.object({
-        nodeId: import_zod.z.string().describe("The ID of the text node"),
-        text: import_zod.z.string().describe("The replacement text")
+    nodeId: import_zod2.z.string().describe("The ID of the node containing the text nodes to replace"),
+    text: import_zod2.z.array(
+      import_zod2.z.object({
+        nodeId: import_zod2.z.string().describe("The ID of the text node"),
+        text: import_zod2.z.string().describe("The replacement text")
       })
     ).describe("Array of text node IDs and their replacement texts")
   },
@@ -1827,9 +2263,9 @@ server.tool(
   "set_layout_mode",
   "Set the layout mode and wrap behavior of a frame in Figma",
   {
-    nodeId: import_zod.z.string().describe("The ID of the frame to modify"),
-    layoutMode: import_zod.z.enum(["NONE", "HORIZONTAL", "VERTICAL"]).describe("Layout mode for the frame"),
-    layoutWrap: import_zod.z.enum(["NO_WRAP", "WRAP"]).optional().describe("Whether the auto-layout frame wraps its children")
+    nodeId: import_zod2.z.string().describe("The ID of the frame to modify"),
+    layoutMode: import_zod2.z.enum(["NONE", "HORIZONTAL", "VERTICAL"]).describe("Layout mode for the frame"),
+    layoutWrap: import_zod2.z.enum(["NO_WRAP", "WRAP"]).optional().describe("Whether the auto-layout frame wraps its children")
   },
   async ({ nodeId, layoutMode, layoutWrap }) => {
     try {
@@ -1863,11 +2299,11 @@ server.tool(
   "set_padding",
   "Set padding values for an auto-layout frame in Figma",
   {
-    nodeId: import_zod.z.string().describe("The ID of the frame to modify"),
-    paddingTop: import_zod.z.number().optional().describe("Top padding value"),
-    paddingRight: import_zod.z.number().optional().describe("Right padding value"),
-    paddingBottom: import_zod.z.number().optional().describe("Bottom padding value"),
-    paddingLeft: import_zod.z.number().optional().describe("Left padding value")
+    nodeId: import_zod2.z.string().describe("The ID of the frame to modify"),
+    paddingTop: import_zod2.z.number().optional().describe("Top padding value"),
+    paddingRight: import_zod2.z.number().optional().describe("Right padding value"),
+    paddingBottom: import_zod2.z.number().optional().describe("Bottom padding value"),
+    paddingLeft: import_zod2.z.number().optional().describe("Left padding value")
   },
   async ({ nodeId, paddingTop, paddingRight, paddingBottom, paddingLeft }) => {
     try {
@@ -1909,9 +2345,9 @@ server.tool(
   "set_axis_align",
   "Set primary and counter axis alignment for an auto-layout frame in Figma",
   {
-    nodeId: import_zod.z.string().describe("The ID of the frame to modify"),
-    primaryAxisAlignItems: import_zod.z.enum(["MIN", "MAX", "CENTER", "SPACE_BETWEEN"]).optional().describe("Primary axis alignment (MIN/MAX = left/right in horizontal, top/bottom in vertical). Note: When set to SPACE_BETWEEN, itemSpacing will be ignored as children will be evenly spaced."),
-    counterAxisAlignItems: import_zod.z.enum(["MIN", "MAX", "CENTER", "BASELINE"]).optional().describe("Counter axis alignment (MIN/MAX = top/bottom in horizontal, left/right in vertical)")
+    nodeId: import_zod2.z.string().describe("The ID of the frame to modify"),
+    primaryAxisAlignItems: import_zod2.z.enum(["MIN", "MAX", "CENTER", "SPACE_BETWEEN"]).optional().describe("Primary axis alignment (MIN/MAX = left/right in horizontal, top/bottom in vertical). Note: When set to SPACE_BETWEEN, itemSpacing will be ignored as children will be evenly spaced."),
+    counterAxisAlignItems: import_zod2.z.enum(["MIN", "MAX", "CENTER", "BASELINE"]).optional().describe("Counter axis alignment (MIN/MAX = top/bottom in horizontal, left/right in vertical)")
   },
   async ({ nodeId, primaryAxisAlignItems, counterAxisAlignItems }) => {
     try {
@@ -1949,9 +2385,9 @@ server.tool(
   "set_layout_sizing",
   "Set horizontal and vertical sizing modes for an auto-layout frame in Figma",
   {
-    nodeId: import_zod.z.string().describe("The ID of the frame to modify"),
-    layoutSizingHorizontal: import_zod.z.enum(["FIXED", "HUG", "FILL"]).optional().describe("Horizontal sizing mode (HUG for frames/text only, FILL for auto-layout children only)"),
-    layoutSizingVertical: import_zod.z.enum(["FIXED", "HUG", "FILL"]).optional().describe("Vertical sizing mode (HUG for frames/text only, FILL for auto-layout children only)")
+    nodeId: import_zod2.z.string().describe("The ID of the frame to modify"),
+    layoutSizingHorizontal: import_zod2.z.enum(["FIXED", "HUG", "FILL"]).optional().describe("Horizontal sizing mode (HUG for frames/text only, FILL for auto-layout children only)"),
+    layoutSizingVertical: import_zod2.z.enum(["FIXED", "HUG", "FILL"]).optional().describe("Vertical sizing mode (HUG for frames/text only, FILL for auto-layout children only)")
   },
   async ({ nodeId, layoutSizingHorizontal, layoutSizingVertical }) => {
     try {
@@ -1989,9 +2425,9 @@ server.tool(
   "set_item_spacing",
   "Set distance between children in an auto-layout frame",
   {
-    nodeId: import_zod.z.string().describe("The ID of the frame to modify"),
-    itemSpacing: import_zod.z.number().optional().describe("Distance between children. Note: This value will be ignored if primaryAxisAlignItems is set to SPACE_BETWEEN."),
-    counterAxisSpacing: import_zod.z.number().optional().describe("Distance between wrapped rows/columns. Only works when layoutWrap is set to WRAP.")
+    nodeId: import_zod2.z.string().describe("The ID of the frame to modify"),
+    itemSpacing: import_zod2.z.number().optional().describe("Distance between children. Note: This value will be ignored if primaryAxisAlignItems is set to SPACE_BETWEEN."),
+    counterAxisSpacing: import_zod2.z.number().optional().describe("Distance between wrapped rows/columns. Only works when layoutWrap is set to WRAP.")
   },
   async ({ nodeId, itemSpacing, counterAxisSpacing }) => {
     try {
@@ -2027,7 +2463,7 @@ server.tool(
   "get_reactions",
   "Get Figma Prototyping Reactions from multiple nodes. CRITICAL: The output MUST be processed using the 'reaction_to_connector_strategy' prompt IMMEDIATELY to generate parameters for connector lines via the 'create_connections' tool.",
   {
-    nodeIds: import_zod.z.array(import_zod.z.string()).describe("Array of node IDs to get reactions from")
+    nodeIds: import_zod2.z.array(import_zod2.z.string()).describe("Array of node IDs to get reactions from")
   },
   async ({ nodeIds }) => {
     try {
@@ -2064,7 +2500,7 @@ server.tool(
   "set_default_connector",
   "Set a copied connector node as the default connector",
   {
-    connectorId: import_zod.z.string().optional().describe("The ID of the connector node to set as default")
+    connectorId: import_zod2.z.string().optional().describe("The ID of the connector node to set as default")
   },
   async ({ connectorId }) => {
     try {
@@ -2095,10 +2531,10 @@ server.tool(
   "create_connections",
   "Create connections between nodes using the default connector style",
   {
-    connections: import_zod.z.array(import_zod.z.object({
-      startNodeId: import_zod.z.string().describe("ID of the starting node"),
-      endNodeId: import_zod.z.string().describe("ID of the ending node"),
-      text: import_zod.z.string().optional().describe("Optional text to display on the connector")
+    connections: import_zod2.z.array(import_zod2.z.object({
+      startNodeId: import_zod2.z.string().describe("ID of the starting node"),
+      endNodeId: import_zod2.z.string().describe("ID of the ending node"),
+      text: import_zod2.z.string().optional().describe("Optional text to display on the connector")
     })).describe("Array of node connections to create")
   },
   async ({ connections }) => {
@@ -2140,7 +2576,7 @@ server.tool(
   "set_focus",
   "Set focus on a specific node in Figma by selecting it and scrolling viewport to it",
   {
-    nodeId: import_zod.z.string().describe("The ID of the node to focus on")
+    nodeId: import_zod2.z.string().describe("The ID of the node to focus on")
   },
   async ({ nodeId }) => {
     try {
@@ -2170,7 +2606,7 @@ server.tool(
   "set_selections",
   "Set selection to multiple nodes in Figma and scroll viewport to show them",
   {
-    nodeIds: import_zod.z.array(import_zod.z.string()).describe("Array of node IDs to select")
+    nodeIds: import_zod2.z.array(import_zod2.z.string()).describe("Array of node IDs to select")
   },
   async ({ nodeIds }) => {
     try {
@@ -2300,14 +2736,25 @@ function connectToFigma(port = 3055) {
           const request = pendingRequests.get(requestId);
           request.lastActivity = Date.now();
           clearTimeout(request.timeout);
+          const remainingMs = request.expiresAt - Date.now();
+          if (remainingMs <= 0) {
+            pendingRequests.delete(requestId);
+            request.reject(new Error("Request to Figma exceeded the maximum duration of 10 minutes"));
+            return;
+          }
           request.timeout = setTimeout(() => {
             if (pendingRequests.has(requestId)) {
-              logger.error(`Request ${requestId} timed out after extended period of inactivity`);
+              const expired = Date.now() >= request.expiresAt;
+              logger.error(expired ? `Request ${requestId} exceeded the maximum duration of 10 minutes` : `Request ${requestId} timed out after an extended period of inactivity`);
               pendingRequests.delete(requestId);
-              request.reject(new Error("Request to Figma timed out"));
+              request.reject(new Error(expired ? "Request to Figma exceeded the maximum duration of 10 minutes" : "Request to Figma timed out"));
             }
-          }, 6e4);
-          logger.info(`Progress update for ${progressData.commandType}: ${progressData.progress}% - ${progressData.message}`);
+          }, Math.min(6e4, remainingMs));
+          if (progressData.payload?.heartbeat) {
+            logger.debug(`Heartbeat for ${progressData.commandType}: ${progressData.message}`);
+          } else {
+            logger.info(`Progress update for ${progressData.commandType}: ${progressData.progress}% - ${progressData.message}`);
+          }
           if (progressData.status === "completed" && progressData.progress === 100) {
             logger.info(`Operation ${progressData.commandType} completed, waiting for final result`);
           }
@@ -2366,6 +2813,7 @@ async function joinChannel(channelName) {
   }
 }
 var DEFAULT_COMMAND_TIMEOUT_MS = 3e4;
+var MAX_COMMAND_DURATION_MS = 10 * 60 * 1e3;
 var COMMAND_TIMEOUT_MS = {
   get_node_info: 6e4,
   read_my_design: 6e4,
@@ -2414,7 +2862,8 @@ function sendCommandToFigma(command, params = {}, timeoutMs) {
       resolve,
       reject,
       timeout,
-      lastActivity: Date.now()
+      lastActivity: Date.now(),
+      expiresAt: Date.now() + MAX_COMMAND_DURATION_MS
     });
     logger.info(`Sending command to Figma: ${command}`);
     logger.debug(`Request details: ${JSON.stringify(request)}`);
@@ -2425,7 +2874,7 @@ server.tool(
   "join_channel",
   "Join a specific channel to communicate with Figma",
   {
-    channel: import_zod.z.string().describe("The name of the channel to join").default("")
+    channel: import_zod2.z.string().describe("The name of the channel to join").default("")
   },
   async ({ channel }) => {
     try {

@@ -7,6 +7,7 @@ import WebSocket from "ws";
 import { v4 as uuidv4 } from "uuid";
 import https from "https";
 import http from "http";
+import { createMinioUploadContext, minioConfigFields, setMinioConfig, uploadImageToMinio, uploadLocalImageToMinio, MinioUploadContext } from "./minio.js";
 
 // Define TypeScript interfaces for Figma responses
 interface FigmaResponse {
@@ -86,7 +87,8 @@ const pendingRequests = new Map<string, {
   resolve: (value: unknown) => void;
   reject: (reason: unknown) => void;
   timeout: ReturnType<typeof setTimeout>;
-  lastActivity: number; // Add timestamp for last activity
+  lastActivity: number;
+  expiresAt: number;
 }>();
 
 // Track which channel each client is in
@@ -196,17 +198,25 @@ server.tool(
   }
 );
 
+const nodeReadToolOptions = {
+  includeGeometry: z.boolean().optional().describe("Include vector paths and geometry data when present"),
+  maxDepth: z.number().int().min(0).max(50).optional().describe("Maximum descendant depth relative to the requested root; omit for unlimited depth"),
+  includeHidden: z.boolean().optional().describe("Include hidden subtrees; defaults to false"),
+  maxNodes: z.number().int().min(1).max(1000).optional().describe("Maximum non-root nodes returned per page; defaults to 300"),
+  cursor: z.string().regex(/^\d+$/).optional().describe("Use the previous response's page.nextCursor with unchanged read options"),
+};
+
 // Node Info Tool
 server.tool(
   "get_node_info",
-  "Get detailed information about a specific node in Figma",
+  "Get detailed information about a specific node in Figma. Hidden subtrees are excluded by default and results are paginated; follow page.nextCursor until null and merge repeated ancestor nodes by ID.",
   {
     nodeId: z.string().describe("The ID of the node to get information about"),
-    includeGeometry: z.boolean().optional().describe("Include vector paths and geometry data when present"),
+    ...nodeReadToolOptions,
   },
-  async ({ nodeId, includeGeometry }: any) => {
+  async (input: any) => {
     try {
-      const result = await sendCommandToFigma("get_node_info", { nodeId, includeGeometry });
+      const result = await sendCommandToFigma("get_node_info", input);
       return {
         content: [
           {
@@ -232,19 +242,18 @@ server.tool(
 // Nodes Info Tool
 server.tool(
   "get_nodes_info",
-  "Get detailed information about multiple nodes in Figma",
+  "Get detailed information about multiple nodes in Figma sequentially to avoid concurrent Figma exports. Each node follows the same pagination contract as get_node_info.",
   {
-    nodeIds: z.array(z.string()).describe("Array of node IDs to get information about"),
-    includeGeometry: z.boolean().optional().describe("Include vector paths and geometry data when present"),
+    nodeIds: z.array(z.string()).min(1).max(20).describe("Array of node IDs to get information about; maximum 20 per call"),
+    ...nodeReadToolOptions,
   },
-  async ({ nodeIds, includeGeometry }: any) => {
+  async ({ nodeIds, ...options }: any) => {
     try {
-      const results = await Promise.all(
-        nodeIds.map(async (nodeId: any) => {
-          const result = await sendCommandToFigma('get_node_info', { nodeId, includeGeometry });
-          return { nodeId, info: result };
-        })
-      );
+      const results = [];
+      for (const nodeId of nodeIds) {
+        const result = await sendCommandToFigma('get_node_info', { nodeId, ...options });
+        results.push({ nodeId, info: result });
+      }
       return {
         content: [
           {
@@ -815,23 +824,174 @@ server.tool(
   }
 );
 
+server.tool(
+  "set_minio_config",
+  "Create or update minio.json in an absolute project root for direct MinIO image uploads. Existing values are preserved when fields are omitted. Credentials are never returned.",
+  {
+    projectRoot: z.string().describe("Absolute path to the target project containing minio.json"),
+    ...z.object(minioConfigFields).partial().shape,
+  },
+  async (input: any) => {
+    try {
+      const result = await setMinioConfig(input);
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+      };
+    } catch (error) {
+      return {
+        content: [{
+          type: "text",
+          text: `Error setting MinIO config: ${error instanceof Error ? error.message : String(error)}`,
+        }],
+      };
+    }
+  }
+);
+
+const uploadImageItemSchema = z.discriminatedUnion("source", [
+  z.object({
+    source: z.literal("figma"),
+    nodeId: z.string().min(1).describe("The ID of the Figma node to export"),
+    format: z.enum(["PNG", "JPG", "SVG", "PDF"]).optional().describe("Figma export format; defaults to PNG"),
+    scale: z.number().positive().optional().describe("Figma export scale; defaults to 1"),
+    filename: z.string().min(1).max(255).optional().describe("Optional semantic filename; extension is normalized to the actual format"),
+  }).strict(),
+  z.object({
+    source: z.literal("local"),
+    path: z.string().min(1).max(4096).describe("Absolute local image path, or a path relative to projectRoot"),
+    filename: z.string().min(1).max(255).optional().describe("Optional semantic filename; defaults to the local filename"),
+  }).strict(),
+]);
+
+type UploadImageItem = z.infer<typeof uploadImageItemSchema>;
+
+async function uploadImageItemToMinio(
+  projectRoot: string,
+  item: UploadImageItem,
+  context?: MinioUploadContext
+) {
+  const uploadContext = context || await createMinioUploadContext(projectRoot);
+  if (item.source === "local") {
+    return uploadLocalImageToMinio({
+      projectRoot,
+      path: item.path,
+      filename: item.filename,
+      context: uploadContext,
+    });
+  }
+
+  const exportResult = await sendCommandToFigma("export_node_as_image", {
+    nodeId: item.nodeId,
+    format: item.format || "PNG",
+    scale: item.scale || 1,
+  });
+  const { imageData, mimeType, format: exportedFormat = "PNG" } = exportResult as {
+    imageData: string;
+    mimeType: string;
+    format?: string;
+  };
+  return uploadImageToMinio({
+    projectRoot,
+    imageData,
+    mimeType,
+    format: exportedFormat,
+    filename: item.filename,
+    scale: item.scale,
+    context: uploadContext,
+  });
+}
+
+server.tool(
+  "upload_images",
+  "Validate projectRoot/minio.json and bucket access before exporting any images, then upload up to 20 Figma node exports and/or local images sequentially. Shared preflight failures stop the batch before Figma export; item failures are isolated.",
+  {
+    projectRoot: z.string().describe("Absolute path to the project containing minio.json"),
+    items: z.array(uploadImageItemSchema).min(1).max(20).describe("Figma and local images to upload sequentially"),
+  },
+  async ({ projectRoot, items }: any) => {
+    const uploadItems = items as UploadImageItem[];
+    let context: MinioUploadContext;
+    try {
+      context = await createMinioUploadContext(projectRoot);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const results = uploadItems.map((item, index) => ({
+        index,
+        source: item.source,
+        ...(item.source === "figma" ? { nodeId: item.nodeId } : { path: item.path }),
+        success: false,
+        error: `Upload preflight failed: ${message}`,
+      }));
+      return {
+        content: [{
+          type: "text" as const,
+          text: JSON.stringify({ success: false, total: results.length, succeeded: 0, failed: results.length, results }, null, 2),
+        }],
+        isError: true,
+      };
+    }
+
+    const results = [];
+    for (const [index, item] of uploadItems.entries()) {
+      const identity = item.source === "figma" ? { nodeId: item.nodeId } : { path: item.path };
+      try {
+        const result = await uploadImageItemToMinio(projectRoot, item, context);
+        results.push({ index, source: item.source, ...identity, success: true, ...result });
+      } catch (error) {
+        results.push({
+          index,
+          source: item.source,
+          ...identity,
+          success: false,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    const succeeded = results.filter((result) => result.success).length;
+    const failed = results.length - succeeded;
+    return {
+      content: [{
+        type: "text",
+        text: JSON.stringify({ success: failed === 0, total: results.length, succeeded, failed, results }, null, 2),
+      }],
+      ...(succeeded === 0 ? { isError: true } : {}),
+    };
+  }
+);
+
 // Export Node as Image and Upload Tool
 server.tool(
   "export_and_upload_image",
-  "Export a node as an image from Figma and upload it to a remote server. The upload is performed by the MCP server (Node.js) so it can bypass browser certificate restrictions.",
+  "Export a Figma node and upload it directly to MinIO using projectRoot/minio.json. The legacy uploadUrl HTTP endpoint remains supported. Pass exactly one of projectRoot or uploadUrl.",
   {
     nodeId: z.string().describe("The ID of the node to export"),
-    uploadUrl: z.string().describe("The URL to upload the image to (e.g. https://192.168.3.11:3000/api/upload-base64)"),
+    projectRoot: z.string().optional().describe("Absolute path to the project containing minio.json"),
+    uploadUrl: z.string().url().optional().describe("Legacy HTTP base64 upload endpoint"),
     format: z
       .enum(["PNG", "JPG", "SVG", "PDF"])
       .optional()
       .describe("Export format"),
     scale: z.number().positive().optional().describe("Export scale"),
-    filename: z.string().optional().describe("Optional filename for the uploaded image"),
+    filename: z.string().optional().describe("Optional semantic filename; extension is normalized to the export format"),
   },
-  async ({ nodeId, uploadUrl, format, scale, filename }: any) => {
+  async ({ nodeId, projectRoot, uploadUrl, format, scale, filename }: any) => {
     try {
-      // Step 1: Export image from Figma as base64
+      if (!!projectRoot === !!uploadUrl) {
+        throw new Error("Pass exactly one of projectRoot or uploadUrl");
+      }
+      if (projectRoot) {
+        const result = await uploadImageItemToMinio(projectRoot, {
+          source: "figma",
+          nodeId,
+          format,
+          scale,
+          filename,
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result) }],
+        };
+      }
+
       const exportResult = await sendCommandToFigma("export_node_as_image", {
         nodeId,
         format: format || "PNG",
@@ -843,7 +1003,7 @@ server.tool(
         format?: string;
       };
 
-      // Step 2: Upload from Node.js side (bypasses browser certificate restrictions)
+      // Legacy HTTP upload from Node.js side (bypasses browser certificate restrictions)
       const dataUri = `data:${mimeType || "image/png"};base64,${imageData}`;
       const postData = JSON.stringify({
         image: dataUri,
@@ -1606,42 +1766,33 @@ server.tool(
 // Node Type Scanning Tool
 server.tool(
   "scan_nodes_by_types",
-  "Scan for child nodes with specific types in the selected Figma node",
+  "Scan child nodes with specific types and return parentId, depth, absoluteBoundingBox, visibility, and child counts. Hidden subtrees are excluded and counted.",
   {
     nodeId: z.string().describe("ID of the node to scan"),
-    types: z.array(z.string()).describe("Array of node types to find in the child nodes (e.g. ['COMPONENT', 'FRAME'])")
+    types: z.array(z.string()).describe("Array of node types to find in the child nodes (e.g. ['COMPONENT', 'FRAME'])"),
+    maxDepth: z.number().int().min(0).max(50).optional().describe("Maximum depth relative to the scanned root; omit for unlimited depth"),
   },
-  async ({ nodeId, types }: any) => {
+  async ({ nodeId, types, maxDepth }: any) => {
     try {
-      // Initial response to indicate we're starting the process
       const initialStatus = {
         type: "text" as const,
         text: `Starting node type scanning for types: ${types.join(', ')}...`,
       };
 
-      // Use the plugin's scan_nodes_by_types function
       const result = await sendCommandToFigma("scan_nodes_by_types", {
         nodeId,
-        types
+        types,
+        maxDepth,
       });
 
-      // Format the response
       if (result && typeof result === 'object' && 'matchingNodes' in result) {
         const typedResult = result as {
           success: boolean,
           count: number,
-          matchingNodes: Array<{
-            id: string,
-            name: string,
-            type: string,
-            bbox: {
-              x: number,
-              y: number,
-              width: number,
-              height: number
-            }
-          }>,
-          searchedTypes: Array<string>
+          matchingNodes: Array<Record<string, unknown>>,
+          searchedTypes: Array<string>,
+          hiddenNodeCount: number,
+          depthLimitedNodeCount: number,
         };
 
         const summaryText = `Scan completed: Found ${typedResult.count} nodes matching types: ${typedResult.searchedTypes.join(', ')}`;
@@ -1655,7 +1806,7 @@ server.tool(
             },
             {
               type: "text" as const,
-              text: JSON.stringify(typedResult.matchingNodes, null, 2)
+              text: JSON.stringify(typedResult, null, 2)
             }
           ],
         };
@@ -2704,8 +2855,22 @@ type CommandParams = {
   get_document_info: Record<string, never>;
   get_selection: Record<string, never>;
   read_my_design: { includeGeometry?: boolean };
-  get_node_info: { nodeId: string; includeGeometry?: boolean };
-  get_nodes_info: { nodeIds: string[]; includeGeometry?: boolean };
+  get_node_info: {
+    nodeId: string;
+    includeGeometry?: boolean;
+    maxDepth?: number;
+    includeHidden?: boolean;
+    maxNodes?: number;
+    cursor?: string;
+  };
+  get_nodes_info: {
+    nodeIds: string[];
+    includeGeometry?: boolean;
+    maxDepth?: number;
+    includeHidden?: boolean;
+    maxNodes?: number;
+    cursor?: string;
+  };
   create_rectangle: {
     x: number;
     y: number;
@@ -2788,7 +2953,8 @@ type CommandParams = {
   };
   export_and_upload_image: {
     nodeId: string;
-    uploadUrl: string;
+    projectRoot?: string;
+    uploadUrl?: string;
     format?: "PNG" | "JPG" | "SVG" | "PDF";
     scale?: number;
     filename?: string;
@@ -2837,6 +3003,7 @@ type CommandParams = {
   scan_nodes_by_types: {
     nodeId: string;
     types: Array<string>;
+    maxDepth?: number;
   };
   get_reactions: { nodeIds: string[] };
   set_default_connector: {
@@ -2927,20 +3094,32 @@ function connectToFigma(port: number = 3055) {
           // Update last activity timestamp
           request.lastActivity = Date.now();
 
-          // Reset the timeout to prevent timeouts during long-running operations
           clearTimeout(request.timeout);
+          const remainingMs = request.expiresAt - Date.now();
+          if (remainingMs <= 0) {
+            pendingRequests.delete(requestId);
+            request.reject(new Error('Request to Figma exceeded the maximum duration of 10 minutes'));
+            return;
+          }
 
-          // Create a new timeout
           request.timeout = setTimeout(() => {
             if (pendingRequests.has(requestId)) {
-              logger.error(`Request ${requestId} timed out after extended period of inactivity`);
+              const expired = Date.now() >= request.expiresAt;
+              logger.error(expired
+                ? `Request ${requestId} exceeded the maximum duration of 10 minutes`
+                : `Request ${requestId} timed out after an extended period of inactivity`);
               pendingRequests.delete(requestId);
-              request.reject(new Error('Request to Figma timed out'));
+              request.reject(new Error(expired
+                ? 'Request to Figma exceeded the maximum duration of 10 minutes'
+                : 'Request to Figma timed out'));
             }
-          }, 60000); // 60 second timeout for inactivity
+          }, Math.min(60000, remainingMs));
 
-          // Log progress
-          logger.info(`Progress update for ${progressData.commandType}: ${progressData.progress}% - ${progressData.message}`);
+          if (progressData.payload?.heartbeat) {
+            logger.debug(`Heartbeat for ${progressData.commandType}: ${progressData.message}`);
+          } else {
+            logger.info(`Progress update for ${progressData.commandType}: ${progressData.progress}% - ${progressData.message}`);
+          }
 
           // For completed updates, we could resolve the request early if desired
           if (progressData.status === 'completed' && progressData.progress === 100) {
@@ -3027,6 +3206,7 @@ async function joinChannel(channelName: string): Promise<void> {
 }
 
 const DEFAULT_COMMAND_TIMEOUT_MS = 30000;
+const MAX_COMMAND_DURATION_MS = 10 * 60 * 1000;
 const COMMAND_TIMEOUT_MS: Partial<Record<FigmaCommand, number>> = {
   get_node_info: 60000,
   read_my_design: 60000,
@@ -3091,7 +3271,8 @@ function sendCommandToFigma(
       resolve,
       reject,
       timeout,
-      lastActivity: Date.now()
+      lastActivity: Date.now(),
+      expiresAt: Date.now() + MAX_COMMAND_DURATION_MS,
     });
 
     // Send the request

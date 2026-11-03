@@ -801,6 +801,8 @@
 
       // Function to update progress UI
       function updateProgressUI(progressData) {
+        if (progressData.payload?.heartbeat) return;
+
         // Show progress container if hidden
         progressContainer.classList.remove("hidden");
 

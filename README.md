@@ -128,11 +128,11 @@ The MCP server provides the following tools for interacting with Figma:
 
 ### Document & Selection
 
-- `get_document_info` - Get information about the current Figma document
+- `get_document_info` - Get current-page top-level nodes with visibility, child counts, and absolute bounds
 - `get_selection` - Get information about the current selection
 - `read_my_design` - Get detailed node information about the current selection without parameters
-- `get_node_info` - Get detailed information about a specific node
-- `get_nodes_info` - Get detailed information about multiple nodes by providing an array of node IDs
+- `get_node_info` - Read a node with optional depth, hidden-subtree, page-size, and cursor controls; follow `page.nextCursor` until null
+- `get_nodes_info` - Read up to 20 nodes sequentially with the same pagination contract, avoiding concurrent Figma exports
 - `set_focus` - Set focus on a specific node by selecting it and scrolling viewport to it
 - `set_selections` - Set selection to multiple nodes and scroll viewport to show them
 
@@ -193,7 +193,32 @@ The MCP server provides the following tools for interacting with Figma:
 
 ### Export & Advanced
 
-- `export_node_as_image` - Export a node as an image (PNG, JPG, SVG, or PDF) - limited support on image currently returning base64 as text
+- `export_node_as_image` - Export a node as MCP image content (PNG, JPG, SVG, or PDF)
+- `set_minio_config` - Create or update `minio.json` in a target project and add it to the project's `.gitignore`
+- `upload_images` - Preflight MinIO once, then upload Figma node exports and local images through one batch interface
+- `export_and_upload_image` - Backward-compatible single Figma export/upload tool, with legacy HTTP `uploadUrl` support
+
+#### Direct MinIO uploads
+
+Call `set_minio_config` with the absolute `projectRoot` and the MinIO connection fields, or copy `example/minio.example.json` to the target project as `minio.json` and fill in real values. Omitted fields preserve existing values when using the tool. The stored configuration supports `endPoint`, `port`, `useSSL`, `accessKey`, `secretKey`, `bucket`, `prefix`, and an optional `publicBaseUrl` (including the bucket) when the URL used in generated code differs from the upload endpoint.
+
+Then call `upload_images` with the same absolute `projectRoot` and up to 20 items. Each call validates the configuration and bucket access before any Figma export. A shared preflight failure stops the whole batch immediately; after preflight succeeds, individual export and upload failures remain isolated. Figma items accept `nodeId` and optional `format`, `scale`, and `filename`; local items accept `path` and optional `filename`. Sources can be mixed in one call:
+
+```json
+{
+  "projectRoot": "/absolute/path/to/project",
+  "items": [
+    { "source": "figma", "nodeId": "123:456", "format": "PNG", "scale": 2, "filename": "hero" },
+    { "source": "local", "path": "/absolute/path/to/avatar.jpg", "filename": "avatar" }
+  ]
+}
+```
+
+Local paths are read on the machine running the MCP server; relative paths resolve from `projectRoot`. PNG, JPG, GIF, WEBP, SVG, and PDF are detected from file content, with a 10MB per-file limit. Local-only calls do not require Figma or a channel. Figma exports and local files share the same MinIO upload path without creating temporary image files.
+
+The response contains `total`, `succeeded`, `failed`, and a `results` entry for each input. Successful entries include `imageUrl`, `bucket`, `objectName`, `mimeType`, `format`, `scale`, and `size`; failures are isolated to their item. The older `export_and_upload_image` remains available for existing Figma-only integrations.
+
+`minio.json` contains credentials: do not commit it or paste real credentials into shared conversations. The configuration tool writes it with user-only permissions and never returns credential values.
 
 ### Connection Management
 

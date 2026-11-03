@@ -38,7 +38,8 @@ Runs inside Figma. `code.js` is the plugin main thread handling 30+ commands via
 
 - **Colors**: Figma uses RGBA 0-1 range. The MCP tools accept 0-1 floats and the filter converts to hex for display.
 - **Logging**: All logs go to stderr. Stdout is reserved for MCP protocol messages.
-- **Timeouts**: 30s default per command. Progress updates from the plugin reset the inactivity timer.
+- **Timeouts**: 30s default per command, with longer initial timeouts for reads and exports. The plugin sends a heartbeat every 10s during execution; progress and heartbeats reset the 60s inactivity timer, but every command has a 10-minute maximum total duration.
+- **Reading**: `get_node_info` excludes hidden subtrees by default and returns at most 300 non-root nodes per page. Follow `page.nextCursor` with unchanged options and merge repeated ancestors by ID. `get_nodes_info` reads sequentially to avoid concurrent Figma exports.
 - **Chunking**: Large operations (scanning 100+ nodes) are chunked with progress updates to prevent Figma UI freezing.
 - **Reconnection**: WebSocket auto-reconnects after 2 seconds on disconnect.
 - **Zod validation**: All tool parameters are validated with Zod schemas.
